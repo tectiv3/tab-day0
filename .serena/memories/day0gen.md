@@ -88,11 +88,21 @@ The real DXVision assembly must be loaded (via the resolver) and used.
    (construction was reached for the first time). The tool now sets them itself.
 5. With the handoff bypassed, `new ZXLevelState()` still throws `NullReferenceException` at
    `#=zOHDY2QTzgRSB()` → `DXProject.Current` is null (the zombie engine's scene/project init never
-   completed; in a headless SSH session the engine thread throws its own NRE). Added a
-   `WaitForProjectContext()` (poll `DXProject.Current` up to 90 s) before construction. Whether the
-   interactive engine ever completes scene init is the next live unknown.
+   completed). Added `WaitForProjectContext()` (poll the `DXProject.Current` static **field** up to
+   90 s, fail fast if the engine thread dies) before construction.
+6. **Root cause of #5: a race in `CheckThemeTable()`.** It invoked the engine table loader while the
+   engine's own `Main` was still running "Tables Excel Read" inside the manager ctor; the concurrent
+   load corrupted shared static tables and the ctor NRE'd (`ZXLog`: `ZXGame Creation Failed`,
+   `#=z$RSG5DA=` ← `.ctor()`). Fix: `CheckThemeTable()` now waits **passively** for the engine's own
+   table load (poll, no loader call) and only invokes the loader as a last resort once
+   `engineThreadDead`. After the fix the ctor completes and tables load via the engine.
+7. Headless (SSH/session 0) **cannot** finish engine init: the engine throws
+   `InvalidOperationException: Showing a modal dialog box ... not ... UserInteractive`. So `--phase
+   full` must be run **interactively** (the user's desktop, via `run-day0-full.bat`). Also switched the
+   engine invocation from `{ "" }` (TABSAT's args-error stall) to `new string[0]` (normal launch), so
+   the engine reaches the main menu instead of parking at the args-error modal.
 
-Live re-test of `--phase full` pending (interactive, via `run-day0-full.bat`, run by the user).
+Live re-test of `--phase full` **interactively** pending.
 
 ## Project memory / tooling
 

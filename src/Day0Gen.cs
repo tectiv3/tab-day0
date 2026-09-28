@@ -1224,17 +1224,20 @@ namespace Day0Gen
 
         private static void ZombieInit()
         {
-            // Match TABSAT's initialiseBillionsAndStall: pass a SINGLE EMPTY STRING.
-            // The engine reads that as an init-and-stall launch and parks at the harmless
-            // error popup, which we minimize. Real args make the bootstrap treat it as a
-            // normal launch and hand off to Steam (Process.Start + Environment.Exit),
-            // killing this process before any construction happens.
+            // Empty args = a normal launch: the engine runs its own startup in-process
+            // and reaches the main menu, which is what populates DXProject.Current.
+            // TABSAT passes new string[] { "" }; that empty-string arg makes the engine
+            // settle at its args-error modal and stall there, leaving DXProject.Current
+            // unset. Real (non-empty) args made the bootstrap treat this as a normal
+            // Steam launch and hand off (Process.Start + Environment.Exit), killing this
+            // process before construction; that handoff is now bypassed by the Steam env
+            // vars set before Main is invoked.
             Thread t = new Thread(delegate()
             {
                 try
                 {
                     Log.Write("Engine thread: invoking ZX.Program.Main ...");
-                    refl.MainMethod.Invoke(null, new object[] { new string[] { "" } });
+                    refl.MainMethod.Invoke(null, new object[] { new string[0] });
                     Log.Write("Engine thread: Main returned.");
                 }
                 catch (Exception e)
@@ -1519,7 +1522,7 @@ namespace Day0Gen
             Log.Write("Waiting for DXProject.Current (engine scene/project context) ...");
             DateTime deadline = DateTime.UtcNow.AddSeconds(90);
             int polls = 0;
-            while (DateTime.UtcNow < deadline)
+            while (DateTime.UtcNow < deadline && !engineThreadDead)
             {
                 object current = null;
                 try
@@ -1553,6 +1556,8 @@ namespace Day0Gen
                 Thread.Sleep(500);
             }
 
+            if (engineThreadDead)
+                Log.Write("Engine thread died before DXProject.Current became ready; stopping early.");
             Log.Write("TIMEOUT: DXProject.Current remained null for ~90s; engine scene/project init did not complete.");
             DumpZxLogTail(EffectiveSavesDir(), 60);
             throw new Day0GenException("Engine scene/project init did not complete: DXProject.Current was null " +
