@@ -953,10 +953,28 @@ namespace Day0Gen
                 Exception root = e;
                 if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
                 Log.Write("INVOKE FAILED " + purpose + ": " + root.GetType().Name + ": " + root.Message);
+                if (root.StackTrace != null) Log.Write(root.StackTrace);
+                LogInnerChain(root, "INVOKE FAILED " + purpose + " inner");
                 throw new Day0GenException("Reflection invocation failed: " + purpose, root);
             }
             Log.Write("INVOKE OK " + purpose + " -> " + ShortResult(result));
             return result;
+        }
+
+        // Records every level of the inner-exception chain (type/message/stack). The
+        // outermost TargetInvocationException is already unwrapped by the caller, so this
+        // starts at root.InnerException.
+        private static void LogInnerChain(Exception root, string label)
+        {
+            Exception cur = root.InnerException;
+            int depth = 0;
+            while (cur != null)
+            {
+                Log.Write(label + "[" + depth + "] " + cur.GetType().FullName + ": " + cur.Message);
+                if (cur.StackTrace != null) Log.Write(label + "[" + depth + "] stack: " + cur.StackTrace);
+                cur = cur.InnerException;
+                depth++;
+            }
         }
 
         // Constructor variant of Invoke: Activator wraps ctor exceptions in
@@ -1673,6 +1691,14 @@ namespace Day0Gen
             object sys = refl.Invoke("DXSystem.Load<gamesystem>(false)",
                 refl.DxSystemLoadMethod.MakeGenericMethod(refl.GameSystemType), null, false);
             refl.SetProp("manager.CurrentGameSystem=sys", refl.CurrentGameSystemProp, managerInstance, sys);
+
+            Log.Write("Effective ZXRandomLevelParams read back before generation:");
+            refl.GetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p);
+            refl.GetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p);
+            refl.GetProp("params.ThemeType", refl.ParamsType.GetProperty("ThemeType"), p);
+            refl.GetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p);
+            refl.GetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p);
+            refl.GetProp("params.Name", refl.ParamsType.GetProperty("Name"), p);
 
             Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
             object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);

@@ -102,7 +102,14 @@ The real DXVision assembly must be loaded (via the resolver) and used.
    engine invocation from `{ "" }` (TABSAT's args-error stall) to `new string[0]` (normal launch), so
    the engine reaches the main menu instead of parking at the args-error modal.
 
-Live re-test of `--phase full` **interactively** pending.
+RESULT (interactive): the engine **fully initializes** — ZXLog shows `Steamworks IDapp=644930`,
+`SteamAPI.Init OK`, `Steam Validation OK`, `Platform Init OK`, `Direct3D Creation Success`,
+`Tables Excel Read: OK`; `DXProject.Current` becomes non-null (~24 polls); construction runs clean
+(`new ZXLevelState()` OK, `Init()` OK, `DXSystem.Load` OK). Remaining failure: the **generator**
+`#=zEzgd90E=(params)` NREs right after logging `Random Map Creation with seed: 550040233`
+(generator source: `vendor/decompiled/--zyl_NPjjlA7DRfVtsRJCX1kN4BxSr.cs` line 20, ~line 84 uses the
+theme table). Added generator stack-trace logging + effective-params logging; next run should
+localize it.
 
 ## Project memory / tooling
 
