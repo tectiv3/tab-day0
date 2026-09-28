@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -330,9 +331,39 @@ namespace Day0Gen
             Log.Write("Loading assembly TheyAreBillions ...");
             TabAssembly = Assembly.Load("TheyAreBillions");
             Log.Write("Loaded: " + TabAssembly.FullName);
-            Log.Write("Loading assembly DXVision ...");
-            DxAssembly = Assembly.Load("DXVision");
-            Log.Write("Loaded: " + DxAssembly.FullName);
+
+            // DXVision is a separate assembly with no file on disk: it is embedded in
+            // TheyAreBillions.exe and only materialized by the Eazfuscator AssemblyResolve
+            // handler installed by the TheyAreBillions module initializer. Run that
+            // initializer before any GetTypes() and before Assembly.Load("DXVision").
+            bool moduleCtorRan = true;
+            try
+            {
+                RuntimeHelpers.RunModuleConstructor(TabAssembly.ManifestModule.ModuleHandle);
+                Log.Write("Ran TheyAreBillions module initializer (embedded-assembly resolver installed).");
+            }
+            catch (Exception ex)
+            {
+                moduleCtorRan = false;
+                Log.Write("ERROR: TheyAreBillions module initializer failed (" + ex.GetType().Name + ": " +
+                          ex.Message + "); the embedded DXVision assembly will NOT load and all " +
+                          "DXVision.* types will be unavailable.");
+            }
+
+            try
+            {
+                DxAssembly = Assembly.Load("DXVision");
+                Log.Write("Loaded: " + DxAssembly.FullName);
+            }
+            catch (Exception ex)
+            {
+                DxAssembly = TabAssembly;
+                Log.Write("WARNING: could not load DXVision assembly (" + ex.GetType().Name + ": " + ex.Message +
+                          "); falling back to the TheyAreBillions assembly. DXVision.* types will be UNAVAILABLE.");
+                if (!moduleCtorRan)
+                    Log.Write("WARNING: fallback is expected to fail: the module initializer that installs the " +
+                              "DXVision resolver did not run.");
+            }
         }
 
         private static string Sig(MethodBase m)
@@ -995,10 +1026,11 @@ namespace Day0Gen
         {
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
             string exe = Path.Combine(opts.TabDir, "TheyAreBillions.exe");
-            string dx = Path.Combine(opts.TabDir, "DXVision.dll");
-            if (!File.Exists(exe) || !File.Exists(dx))
-                throw new Day0GenException("TheyAreBillions.exe / DXVision.dll not found in TAB dir '" + opts.TabDir +
+            if (!File.Exists(exe))
+                throw new Day0GenException("TheyAreBillions.exe not found in TAB dir '" + opts.TabDir +
                                            "'. Run Day0Gen from the TAB install directory (or pass --tab-dir).");
+            if (!File.Exists(Path.Combine(opts.TabDir, "DXVision.dll")))
+                Log.Write("NOTE: no separate DXVision.dll; DXVision is an embedded assembly materialized by the TheyAreBillions module initializer.");
             Log.Write("TAB dir verified: " + opts.TabDir);
             if (string.Compare(Path.GetFullPath(baseDir).TrimEnd('\\'),
                                Path.GetFullPath(opts.TabDir).TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) != 0)

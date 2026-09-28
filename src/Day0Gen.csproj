@@ -11,6 +11,8 @@
     <LangVersion>5</LangVersion>
     <RootNamespace>Day0Gen</RootNamespace>
     <AssemblyName>Day0Gen</AssemblyName>
+    <!-- x64: the game assembly (and its SlimDX/DXVision deps) is 64-bit; type loading fails in a 32-bit process -->
+    <PlatformTarget>x64</PlatformTarget>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
     <Nullable>disable</Nullable>

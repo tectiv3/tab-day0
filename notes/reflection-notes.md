@@ -138,4 +138,33 @@ Fallback executed meanwhile: strict mechanical C#5 audit of `src/Day0Gen.cs`
 - Braces/parens/brackets balanced.
 - APIs used are all net48 `System.*` (no extra compile-time deps).
 
-(Outcome of the dotnet build attempt will be recorded here once the download finishes.)
+(Outcome: the dotnet-sdk download completed; `make build` compiles clean under `LangVersion 5` /
+net48, and `make audit` reports no C#6+ constructs.)
+
+## 10. DXVision assembly resolution — fixed after the first on-target run
+
+First real `--phase discovery` on the target failed: `Assembly.Load("TheyAreBillions")` +
+`GetTypes()` threw `ReflectionTypeLoadException` (1677 types total, **507 failed**), and the manager
+class (owner of `get_GameAccount`) was among the failures → abort.
+
+Root cause: `TheyAreBillions.exe` (v1.0.14.29) references a **separate** assembly
+`DXVision, Version=1.0.0.0` that has **no file on disk**. It is embedded as a manifest resource and
+decrypted/loaded by an Eazfuscator `AssemblyResolve` handler installed by the TheyAreBillions **module
+initializer**. Discovery never executes any game code, so the resolver was never installed and every
+DXVision-derived type failed to load. (`TabAssembly.GetType("DXVision.*")` cannot find them either —
+they live in the separate assembly's metadata, not in `TheyAreBillions.exe`.)
+
+Fix (in `GameReflector.LoadAssemblies()`): load TheyAreBillions, then
+`RuntimeHelpers.RunModuleConstructor(TabAssembly.ManifestModule.ModuleHandle)` to install the resolver,
+then `Assembly.Load("DXVision")`. Verified live: all 1677 types load; `DXVision.DXLevel`,
+`DXVision.DXSystem`, `DXVision.Serialization.ZipSerializer` all resolve; the module initializer does
+**not** start the game.
+
+Resolver source in the decompile:
+`vendor/decompiled/--qfkZ-KkimwzG_5GjOFAkJH7Cbg6LrXJCCJODXq7ULSO4-.cs`
+(`AppDomain.CurrentDomain.AssemblyResolve += …`, registered by `_0023_003DzX6exa18_003D()`).
+
+With this fix, `--phase discovery` completes on the target: every SPEC reflection target found
+(manager, signer, password flag/setter/clearer, native save writer, saves-folder, save list,
+ZXGameState/ZXLevelState Set/Current/Init, ZXRandomLevelParams, generator, theme table + loader,
+game system + SetLevel, DXSystem.Load<T>, ZipSerializer.Read/Write, ZXFile<T> read).
