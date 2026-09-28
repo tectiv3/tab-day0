@@ -1316,32 +1316,109 @@ namespace Day0Gen
             CheckThemeTable();
         }
 
-        private static void CheckThemeTable()
+        private static int ThemeCount(object table)
         {
-            object table = null;
-            bool ok = false;
+            System.Collections.ICollection c = table as System.Collections.ICollection;
+            return c == null ? 0 : c.Count;
+        }
+
+        // Reads the theme table (cheap) and reports whether it is non-empty. A read
+        // that throws is treated as "not ready" so callers can keep waiting.
+        private static bool TryReadThemeTable(string purpose, ref object table)
+        {
+            table = null;
             try
             {
-                table = refl.Invoke("ZXMapTheme theme table", refl.ThemeTableMethod, null);
-                System.Collections.ICollection c = table as System.Collections.ICollection;
-                ok = c != null && c.Count > 0;
+                table = refl.Invoke(purpose, refl.ThemeTableMethod, null);
             }
             catch (Day0GenException e)
             {
-                Log.Write("Theme table check threw: " + e.InnerException.Message);
+                Log.Write("Theme table read threw: " + e.Message);
+                return false;
             }
-            if (!ok && refl.TableLoadMethod != null)
+            return ThemeCount(table) > 0;
+        }
+
+        private static void CheckThemeTable()
+        {
+            // First attempt: the theme table may already be populated.
+            object table = null;
+            if (TryReadThemeTable("ZXMapTheme theme table", ref table))
             {
-                Log.Write("Theme table empty/failed; invoking engine table loader ...");
-                refl.Invoke("engine table loader", refl.TableLoadMethod, null);
-                Thread.Sleep(3000);
-                table = refl.Invoke("ZXMapTheme theme table (retry)", refl.ThemeTableMethod, null);
-                System.Collections.ICollection c = table as System.Collections.ICollection;
-                ok = c != null && c.Count > 0;
+                Log.Write("Theme table OK (" + ThemeCount(table) + " themes).");
+                return;
             }
-            if (!ok)
-                throw new Day0GenException("Theme table unavailable after loader attempt - map generation requires it.");
-            Log.Write("Theme table OK (" + ((System.Collections.ICollection)table).Count + " themes).");
+
+            // Passive wait for the engine's OWN table load. The engine's Main is still
+            // running its "Tables Excel Read" inside the manager ctor; invoking the
+            // loader concurrently corrupts the shared static tables (manager ctor
+            // NREs), so TableLoadMethod must NOT be called while the engine thread is
+            // alive. Poll the table (cheap, at most once per second) and stop as soon
+            // as the engine thread dies.
+            Log.Write("Theme table empty; waiting for engine table load (up to 90s) ...");
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+            DateTime lastRead = DateTime.UtcNow;   // the first read just happened
+            DateTime lastProgress = DateTime.UtcNow;
+            bool engineDied = engineThreadDead;
+            while (DateTime.UtcNow < deadline && !engineDied)
+            {
+                Thread.Sleep(500);
+                engineDied = engineThreadDead;
+                if (DateTime.UtcNow - lastRead >= TimeSpan.FromSeconds(1))
+                {
+                    lastRead = DateTime.UtcNow;
+                    if (TryReadThemeTable("ZXMapTheme theme table (poll)", ref table))
+                    {
+                        Log.Write("Theme table OK after engine-init wait (" + ThemeCount(table) + " themes).");
+                        return;
+                    }
+                }
+                if (DateTime.UtcNow - lastProgress >= TimeSpan.FromSeconds(10))
+                {
+                    lastProgress = DateTime.UtcNow;
+                    int left = (int)(deadline - DateTime.UtcNow).TotalSeconds;
+                    if (left < 0) left = 0;
+                    Log.Write("Theme table still empty (engine " + (engineThreadDead ? "dead" : "alive") +
+                              ", ~" + left + "s left) ...");
+                }
+            }
+
+            // The wait may have ended with the table populated (engine finished init or
+            // died after loading it) - re-check before any fallback.
+            if (TryReadThemeTable("ZXMapTheme theme table (post-wait)", ref table))
+            {
+                Log.Write("Theme table OK (" + ThemeCount(table) + " themes).");
+                return;
+            }
+
+            // Last resort: only once the engine thread is gone. The headless
+            // `--phase zombie` path always ends with the engine dead, so this preserves
+            // it; invoking the loader while the engine is alive would race its own load.
+            if (engineThreadDead && refl.TableLoadMethod != null)
+            {
+                Log.Write("Engine thread died with theme table empty; invoking engine table loader (last resort) ...");
+                try
+                {
+                    refl.Invoke("engine table loader", refl.TableLoadMethod, null);
+                }
+                catch (Day0GenException e)
+                {
+                    Log.Write("Engine table loader threw: " + e.Message);
+                }
+                Thread.Sleep(3000);
+                if (TryReadThemeTable("ZXMapTheme theme table (loader retry)", ref table))
+                {
+                    Log.Write("Theme table OK after loader fallback (" + ThemeCount(table) + " themes).");
+                    return;
+                }
+            }
+            else
+            {
+                Log.Write("Theme table timeout with engine thread still alive; not invoking loader " +
+                          "(would race engine init).");
+            }
+
+            throw new Day0GenException("Theme table unavailable after loader attempt - map generation requires it.");
         }
 
         private static string EffectiveSavesDir()
