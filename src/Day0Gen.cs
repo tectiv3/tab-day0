@@ -4,6 +4,10 @@
 //
 // C# 5 compatible, target net48. Must be run from the TAB install directory
 // (operator places the exe there) so Assembly.Load("TheyAreBillions") resolves.
+// Compile-time deps: System plus in-box System.Windows.Forms - the engine is
+// WinForms (DXVision) and its state is thread-affine, so the construct/generate/
+// save sequence must be marshaled onto the engine's UI thread (see
+// FindEngineUiMarshalTarget / RunConstructGenerateSave).
 //
 // Phases: discovery | zombie | full (later phases imply earlier ones).
 
@@ -17,6 +21,7 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Windows.Forms;
 
 namespace Day0Gen
 {
@@ -1117,6 +1122,12 @@ namespace Day0Gen
         private static GameReflector refl;
         private static volatile bool engineThreadDead;
 
+        // Engine UI-thread marshal diagnostics (filled by FindEngineUiMarshalTarget,
+        // logged right before Control.Invoke in RunFull).
+        private static bool uiMarshalUsedFallback;
+        private static IntPtr uiMarshalMainWindowHandle;
+        private static int uiMarshalFormCount;
+
         // Stable id of the game's built-in project. The generator resolves its entity
         // templates through DXProject.FromID(this), so a non-null result is the real
         // prerequisite for generation (DXProject.Current alone becomes non-null too early,
@@ -1858,6 +1869,112 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
+        // Engine UI-thread marshal target. The engine (DXVision) is WinForms: it
+        // pumps messages on its own STA thread, and engine-side sequences that
+        // mutate scene state must run there (in the real game they live in click
+        // handlers on the message-loop thread). Preference: the Application.OpenForms
+        // form whose handle equals the process MainWindowHandle; fallback
+        // Control.FromHandle(MainWindowHandle). Returns null when neither yields a
+        // Control - the caller then runs inline on its own thread (previous
+        // behavior). Fills the uiMarshal* diagnostics fields for the pre-Invoke log.
+        // ---------------------------------------------------------------------
+        private static Control FindEngineUiMarshalTarget()
+        {
+            uiMarshalUsedFallback = false;
+            uiMarshalMainWindowHandle = IntPtr.Zero;
+            uiMarshalFormCount = 0;
+
+            // MainWindowHandle is a cached snapshot; Refresh() re-reads it. The engine
+            // sits at its main menu by now, so the handle should appear quickly; poll
+            // up to ~30s to tolerate slower frames.
+            DateTime handleDeadline = DateTime.UtcNow.AddSeconds(30);
+            while (DateTime.UtcNow < handleDeadline)
+            {
+                using (Process self = Process.GetCurrentProcess())
+                {
+                    self.Refresh();
+                    if (self.MainWindowHandle != IntPtr.Zero)
+                    {
+                        uiMarshalMainWindowHandle = self.MainWindowHandle;
+                        break;
+                    }
+                }
+                Thread.Sleep(500);
+            }
+            if (uiMarshalMainWindowHandle == IntPtr.Zero)
+                Log.Write("UI-marshal: MainWindowHandle still zero after ~30s of polling.");
+
+            // Snapshot OpenForms once: live enumeration races form create/close on
+            // the engine thread.
+            List<Form> formList = new List<Form>();
+            try
+            {
+                foreach (Form f in Application.OpenForms) formList.Add(f);
+            }
+            catch (Exception e)
+            {
+                Log.Write("UI-marshal: OpenForms enumeration threw: " + e.GetType().Name + ": " + e.Message);
+            }
+            uiMarshalFormCount = formList.Count;
+            Log.Write("UI-marshal: OpenForms count=" + uiMarshalFormCount + ".");
+            for (int i = 0; i < formList.Count; i++)
+            {
+                Log.Write("UI-marshal: form[" + i + "] Name='" + SafeControlName(formList[i]) +
+                          "' Text='" + SafeControlText(formList[i]) + "' Handle=" +
+                          SafeControlHandle(formList[i]) + ".");
+            }
+
+            if (uiMarshalMainWindowHandle != IntPtr.Zero)
+            {
+                for (int i = 0; i < formList.Count; i++)
+                {
+                    try
+                    {
+                        if (formList[i].Handle == uiMarshalMainWindowHandle) return formList[i];
+                    }
+                    catch (Exception)
+                    {
+                        // handle not created - skip this form
+                    }
+                }
+
+                Control fromHandle = null;
+                try { fromHandle = Control.FromHandle(uiMarshalMainWindowHandle); }
+                catch (Exception e)
+                {
+                    Log.Write("UI-marshal: Control.FromHandle threw: " + e.GetType().Name + ": " + e.Message);
+                }
+                if (fromHandle != null)
+                {
+                    uiMarshalUsedFallback = true;
+                    return fromHandle;
+                }
+            }
+
+            return null;
+        }
+
+        // Cross-thread control reads for logging only; WinForms property getters are
+        // not guaranteed thread-safe, so degrade to a placeholder instead of throwing.
+        private static string SafeControlName(Control c)
+        {
+            try { return c.Name == null ? "" : c.Name; }
+            catch (Exception e) { return "<" + e.GetType().Name + ">"; }
+        }
+
+        private static string SafeControlText(Control c)
+        {
+            try { return c.Text == null ? "" : c.Text; }
+            catch (Exception e) { return "<" + e.GetType().Name + ">"; }
+        }
+
+        private static string SafeControlHandle(Control c)
+        {
+            try { return c.Handle.ToString(); }
+            catch (Exception e) { return "<" + e.GetType().Name + ">"; }
+        }
+
+        // ---------------------------------------------------------------------
         // Phase: full — construction + generation + save + verify
         // ---------------------------------------------------------------------
         private static int RunFull()
@@ -1902,6 +2019,129 @@ namespace Day0Gen
 
             WaitForProjectContext();
 
+            // ---- marshal the construct/generate/save sequence onto the engine UI thread.
+            // The zombie engine fully initializes to its main menu - a live WinForms
+            // message pump on the engine thread. In the real game this whole sequence
+            // runs inside a click handler on that thread; run from this thread it races
+            // the engine render loop (ZXGameState.Set / CurrentGameSystem assignment
+            // interleave with the engine's own scene changes) and the generator dies
+            // with a NullReferenceException on thread-affine state.
+            Control uiMarshal = FindEngineUiMarshalTarget();
+            if (uiMarshal != null)
+            {
+                Log.Write("UI-marshal: invoking construct/generate/save on engine UI thread. " +
+                          "MainWindowHandle=" + uiMarshalMainWindowHandle + ", OpenForms count=" +
+                          uiMarshalFormCount + " (names/titles above), caller thread id=" +
+                          Thread.CurrentThread.ManagedThreadId + ", fallback used=" +
+                          (uiMarshalUsedFallback ? "yes (Control.FromHandle)" : "no (OpenForms handle match)") +
+                          ", marshal control=" + uiMarshal.GetType().Name + " '" +
+                          SafeControlName(uiMarshal) + "'.");
+
+                // Deadlock protection: Control.Invoke blocks this thread until the
+                // engine message pump executes the delegate. If that pump is stuck the
+                // run would hang forever; the watchdog aborts the process instead.
+                Exception marshalError = null;
+                bool marshalFinished = false;
+                Thread uiWatchdog = new Thread(delegate()
+                {
+                    DateTime armedAt = DateTime.UtcNow;
+                    while (!marshalFinished)
+                    {
+                        Thread.Sleep(1000);
+                        if (marshalFinished) return;
+                        if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
+                        {
+                            Log.Write("UI-thread marshal watchdog fired - engine loop appears not to pump " +
+                                      "messages; aborting process; if partial files exist, delete '" + target +
+                                      "' / '" + checkPath + "' manually after review.");
+                            Environment.Exit(2);
+                        }
+                    }
+                });
+                uiWatchdog.IsBackground = true;
+                uiWatchdog.Start();
+                try
+                {
+                    uiMarshal.Invoke((MethodInvoker)delegate
+                    {
+                        try
+                        {
+                            RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
+                        }
+                        catch (Exception ex)
+                        {
+                            marshalError = ex;
+                        }
+                    });
+                }
+                finally
+                {
+                    marshalFinished = true;
+                }
+                if (marshalError != null)
+                {
+                    Log.Write("UI-thread marshaled construct/generate/save sequence FAILED; exception chain:");
+                    LogExceptionChain("MARSHAL", marshalError);
+                    if (marshalError is Day0GenException) throw marshalError;
+                    throw new Day0GenException("UI-thread marshaled sequence failed unexpectedly.", marshalError);
+                }
+            }
+            else
+            {
+                Log.Write("WARNING: no engine UI-thread marshal target found (MainWindowHandle=" +
+                          uiMarshalMainWindowHandle + ", OpenForms count=" + uiMarshalFormCount +
+                          "; neither OpenForms handle match nor Control.FromHandle yielded a Control). " +
+                          "Running construct/generate/save on the CURRENT thread (id=" +
+                          Thread.CurrentThread.ManagedThreadId + ") - previous, racy behavior.");
+                RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
+            }
+
+            // ---- after snapshot -------------------------------------------------------
+            Log.Write("Snapshot AFTER ...");
+            DirSnapshot after = DirSnapshot.Take(effectiveSavesDir);
+            after.Add(RootDirOf(effectiveSavesDir));
+            if (string.Compare(effectiveSavesDir, savesDir, StringComparison.OrdinalIgnoreCase) != 0)
+            {
+                after.Add(savesDir);
+                after.Add(rootDir);
+            }
+            List<string> changes = DirSnapshot.Diff(before, after);
+            List<string> unexpected = new List<string>();
+            foreach (string c in changes)
+            {
+                Log.Write("CHANGE: " + c);
+                // change lines use the "<VERB>: <path>" form; ':' cannot occur in
+                // Windows file names so the first ": " cleanly separates
+                string path = c.Substring(c.IndexOf(": ") + 2).Trim();
+                string fileName = Path.GetFileName(path);
+                bool allowed = string.Compare(fileName, opts.Name + ".zxsav", StringComparison.OrdinalIgnoreCase) == 0
+                            || string.Compare(fileName, opts.Name + ".zxcheck", StringComparison.OrdinalIgnoreCase) == 0
+                            || string.Compare(fileName, "ZXLog.txt", StringComparison.OrdinalIgnoreCase) == 0;
+                if (!allowed) unexpected.Add(c);
+            }
+            if (unexpected.Count > 0)
+            {
+                foreach (string u in unexpected) Log.Write("UNEXPECTED FILE CHANGE: " + u);
+                throw new Day0GenException("Unexpected file changes detected (see log). Only " + opts.Name +
+                                           ".zxsav/.zxcheck (+engine ZXLog.txt) may change.");
+            }
+            if (changes.Count == 0) Log.Write("No file changes detected (unexpected for a full run - investigate).");
+
+            Log.Write("PHASE full COMPLETE: " + target);
+            Log.Write("=== Day0Gen OK ===");
+            return 0;
+        }
+
+        // ---------------------------------------------------------------------
+        // Construction + generation + save + verification, extracted from RunFull so
+        // the whole sequence can be marshaled onto the engine UI thread via
+        // Control.Invoke (or, when no marshal target was found, run inline on the
+        // current thread - the previous behavior). Reads the static opts / refl /
+        // managerInstance fields; the before/after snapshot context lives in RunFull
+        // and is not needed here.
+        // ---------------------------------------------------------------------
+        private static void RunConstructGenerateSave(string target, string checkPath, string effectiveSavesDir)
+        {
             // ---- construction: mirror CC handler minus challenge lines ------------
             Log.Write("Constructing game state (name='" + opts.Name + "') ...");
             object gs = refl.Invoke("new ZXGameState(name)", refl.GameStateCtorName, null, opts.Name);
@@ -1941,6 +2181,9 @@ namespace Day0Gen
 
             LogProjectDiagnostics();
 
+            // Bracket the engine-side ZXLog output around the generation call so the
+            // interleaving with the engine's own scene-change logs is visible.
+            DumpZxLogTail(effectiveSavesDir, 15);
             Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
             object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
             if (level == null)
@@ -1997,41 +2240,6 @@ namespace Day0Gen
             if (!listed)
                 throw new Day0GenException("Manager save list does not contain an entry named '" + opts.Name + "'.");
             Log.Write("Save-list verification OK.");
-
-            // ---- after snapshot -------------------------------------------------------
-            Log.Write("Snapshot AFTER ...");
-            DirSnapshot after = DirSnapshot.Take(effectiveSavesDir);
-            after.Add(RootDirOf(effectiveSavesDir));
-            if (string.Compare(effectiveSavesDir, savesDir, StringComparison.OrdinalIgnoreCase) != 0)
-            {
-                after.Add(savesDir);
-                after.Add(rootDir);
-            }
-            List<string> changes = DirSnapshot.Diff(before, after);
-            List<string> unexpected = new List<string>();
-            foreach (string c in changes)
-            {
-                Log.Write("CHANGE: " + c);
-                // change lines use the "<VERB>: <path>" form; ':' cannot occur in
-                // Windows file names so the first ": " cleanly separates
-                string path = c.Substring(c.IndexOf(": ") + 2).Trim();
-                string fileName = Path.GetFileName(path);
-                bool allowed = string.Compare(fileName, opts.Name + ".zxsav", StringComparison.OrdinalIgnoreCase) == 0
-                            || string.Compare(fileName, opts.Name + ".zxcheck", StringComparison.OrdinalIgnoreCase) == 0
-                            || string.Compare(fileName, "ZXLog.txt", StringComparison.OrdinalIgnoreCase) == 0;
-                if (!allowed) unexpected.Add(c);
-            }
-            if (unexpected.Count > 0)
-            {
-                foreach (string u in unexpected) Log.Write("UNEXPECTED FILE CHANGE: " + u);
-                throw new Day0GenException("Unexpected file changes detected (see log). Only " + opts.Name +
-                                           ".zxsav/.zxcheck (+engine ZXLog.txt) may change.");
-            }
-            if (changes.Count == 0) Log.Write("No file changes detected (unexpected for a full run - investigate).");
-
-            Log.Write("PHASE full COMPLETE: " + target);
-            Log.Write("=== Day0Gen OK ===");
-            return 0;
         }
 
         private static void ManualSave(string target, object gs)

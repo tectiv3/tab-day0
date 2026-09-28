@@ -102,7 +102,7 @@ The real DXVision assembly must be loaded (via the resolver) and used.
    engine invocation from `{ "" }` (TABSAT's args-error stall) to `new string[0]` (normal launch), so
    the engine reaches the main menu instead of parking at the args-error modal.
 
-RESULT (interactive): the engine **fully initializes** — ZXLog shows `Steamworks IDapp=644930`,
+RESULT (interactive): the engine **fully initializes** - ZXLog shows `Steamworks IDapp=644930`,
 `SteamAPI.Init OK`, `Steam Validation OK`, `Platform Init OK`, `Direct3D Creation Success`,
 `Tables Excel Read: OK`; `DXProject.Current` becomes non-null (~24 polls); construction runs clean
 (`new ZXLevelState()` OK, `Init()` OK, `DXSystem.Load` OK). Remaining failure: the **generator**
@@ -110,6 +110,19 @@ RESULT (interactive): the engine **fully initializes** — ZXLog shows `Steamwor
 (generator source: `vendor/decompiled/--zyl_NPjjlA7DRfVtsRJCX1kN4BxSr.cs` line 20, ~line 84 uses the
 theme table). Added generator stack-trace logging + effective-params logging; next run should
 localize it.
+8. **Generator NRE root cause (diagnosed from ZXLog interleaving, run 00:47):** the zombie engine
+reaches the MAIN MENU (`ZXGame - ShowStartScreen`, live WinForms pump: `Window - ShowDialog` /
+`DXGame - RenderFrame`). Our construction ran on the TOOL's thread; ZXLog shows the engine's own
+`ZXGame - ChangeScene - Init/Paused/Fade` (reaction to `ZXGameState.Set` + `CurrentGameSystem`
+assignment) interleaved BETWEEN the generator's `Random Map Creation with seed` log and our NRE
+(131 ms apart). In the real game the whole construct->generate->save sequence runs ON the engine's
+UI thread (inside a WinForms click handler). Fix (commit `68dcc3d`): marshal
+`RunConstructGenerateSave()` onto the engine UI thread via `Control.Invoke` on the engine main form
+(`Application.OpenForms` match on `MainWindowHandle`, fallback `Control.FromHandle`, fallback
+old inline path with WARNING); 15-min watchdog `Environment.Exit(2)` protects against a
+non-pumping engine loop (deadlock); extra ZXLog dump before generation brackets engine-side logs.
+ASCII-only log strings (in-box csc codepage hazard). Deployed exe sha256 `b2fce975dd736b4b257730e7...
+` (`b2fce975dd736b4b257730e72b6923a3a1cfe21823693cddad858e751c16267e`). Live re-test pending.
 
 ## Project memory / tooling
 

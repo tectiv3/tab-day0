@@ -2,8 +2,10 @@
 
   <!-- Minimal net48 console project used ONLY for local compile verification on
        macOS via: nix shell nixpkgs#dotnet-sdk -c dotnet build -c Release
-       The operator compiles on Windows with in-box csc.exe (/langversion:5);
-       keep Day0Gen.cs strictly C# 5 and compile-time dependency-free (System only). -->
+       The operator compiles on Windows with in-box csc.exe (/langversion:5,
+       /r:System.Windows.Forms.dll); keep Day0Gen.cs strictly C# 5. Sole compile-time
+       dependency besides System: in-box System.Windows.Forms (engine UI-thread
+       marshaling, see Day0Gen.cs FindEngineUiMarshalTarget / RunConstructGenerateSave). -->
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -20,6 +22,12 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- In-box on Windows. Used ONLY to marshal the construct/generate/save
+         sequence onto the engine's WinForms UI thread (RunFull). -->
+    <Reference Include="System.Windows.Forms" />
   </ItemGroup>
 
 </Project>
