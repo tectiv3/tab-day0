@@ -254,8 +254,10 @@ namespace Day0Gen
         public Type GameModeEnum, MapThemeEnum, ChallengeEnum;
 
         // DXVision.DXProject / .Current: the engine's scene/project context singleton.
+        // Current may be exposed as a property or a field depending on the build.
         public Type DxProjectType;
         public PropertyInfo DxProjectCurrentProp;
+        public FieldInfo DxProjectCurrentField;
 
         // Program
         public MethodInfo MainMethod;
@@ -416,6 +418,13 @@ namespace Day0Gen
             Log.Write("FOUND [" + strategy + "] " + purpose + " -> property " +
                       (p.DeclaringType != null ? p.DeclaringType.Name : "?") + "." + p.Name +
                       " : " + p.PropertyType.Name);
+        }
+
+        private void Found(string purpose, string strategy, FieldInfo f)
+        {
+            Log.Write("FOUND [" + strategy + "] " + purpose + " -> field " +
+                      (f.DeclaringType != null ? f.DeclaringType.Name : "?") + "." + f.Name +
+                      " : " + f.FieldType.Name + (f.IsStatic ? " (static)" : ""));
         }
 
         // -----------------------------------------------------------------------
@@ -767,13 +776,39 @@ namespace Day0Gen
             if (DxProjectType != null)
             {
                 Found("DXProject type", "public-stable-name", DxProjectType);
+
+                // Diagnostic: enumerate the public static surface so the real API is visible
+                // in the log without needing another interactive run.
+                StringBuilder members = new StringBuilder();
+                foreach (PropertyInfo p in DxProjectType.GetProperties(BindingFlags.Static | BindingFlags.Public))
+                {
+                    if (members.Length > 0) members.Append(", ");
+                    members.Append(p.PropertyType.Name).Append(" ").Append(p.Name);
+                }
+                foreach (FieldInfo f in DxProjectType.GetFields(BindingFlags.Static | BindingFlags.Public))
+                {
+                    if (members.Length > 0) members.Append(", ");
+                    members.Append(f.FieldType.Name).Append(" ").Append(f.Name);
+                }
+                Log.Write("DXProject public static members: " +
+                          (members.Length == 0 ? "(none)" : members.ToString()));
+
                 DxProjectCurrentProp = DxProjectType.GetProperty("Current",
                     BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
                 if (DxProjectCurrentProp != null)
+                {
                     Found("DXProject.Current (static)", "public-stable-name", DxProjectCurrentProp);
+                }
                 else
-                    Log.Write("NOTE: DXVision.DXProject.Current property not found; " +
-                              "WaitForProjectContext cannot verify engine init.");
+                {
+                    DxProjectCurrentField = DxProjectType.GetField("Current",
+                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (DxProjectCurrentField != null)
+                        Found("DXProject.Current (static)", "public-stable-name", DxProjectCurrentField);
+                    else
+                        Log.Write("NOTE: DXVision.DXProject.Current (property or field) not found; " +
+                                  "WaitForProjectContext cannot verify engine init.");
+                }
             }
             else
             {
@@ -1399,7 +1434,8 @@ namespace Day0Gen
         // ---------------------------------------------------------------------
         private static void WaitForProjectContext()
         {
-            if (refl.DxProjectType == null || refl.DxProjectCurrentProp == null)
+            if (refl.DxProjectType == null ||
+                (refl.DxProjectCurrentProp == null && refl.DxProjectCurrentField == null))
                 throw new Day0GenException("DXProject.Current was not discovered; cannot verify engine " +
                                            "scene/project init before construction.");
 
@@ -1411,7 +1447,11 @@ namespace Day0Gen
                 object current = null;
                 try
                 {
-                    current = refl.DxProjectCurrentProp.GetValue(null, null);
+                    // Prefer the property if present, otherwise read the field.
+                    if (refl.DxProjectCurrentProp != null)
+                        current = refl.DxProjectCurrentProp.GetValue(null, null);
+                    else
+                        current = refl.DxProjectCurrentField.GetValue(null);
                 }
                 catch (Exception e)
                 {
