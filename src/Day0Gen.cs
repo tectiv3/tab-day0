@@ -258,6 +258,14 @@ namespace Day0Gen
         public PropertyInfo DxProjectCurrentProp;
         public FieldInfo DxProjectCurrentField;
 
+        // Read-only diagnostics surface (Program.LogProjectDiagnostics). None of these
+        // drive generation; they exist solely to explain the generator's DXProject NRE.
+        public MethodInfo DxProjectFromIdMethod;
+        public FieldInfo DxProjectLoadedProjectsField;
+        public FieldInfo DxProjectLastLoadedField;
+        public FieldInfo DxProjectSGameFilesField;
+        public FieldInfo DxProjectSGameDirectoryField;
+
         // Program
         public MethodInfo MainMethod;
 
@@ -808,6 +816,8 @@ namespace Day0Gen
                         Log.Write("NOTE: DXVision.DXProject.Current (property or field) not found; " +
                                   "WaitForProjectContext cannot verify engine init.");
                 }
+
+                DiscoverDxProjectDiagnosticMembers();
             }
             else
             {
@@ -861,6 +871,53 @@ namespace Day0Gen
             {
                 // Nothing extra for now; placeholder for future engine-only targets.
             }
+        }
+
+        // Discovers the DXProject members probed (read-only) by
+        // Program.LogProjectDiagnostics. Absence is never fatal: they only explain the
+        // generator's DXProject.FromID NullReferenceException.
+        private void DiscoverDxProjectDiagnosticMembers()
+        {
+            BindingFlags flags = BindingFlags.Static | BindingFlags.Public;
+
+            try
+            {
+                DxProjectFromIdMethod = DxProjectType.GetMethod("FromID", flags);
+            }
+            catch (AmbiguousMatchException)
+            {
+                // More than one FromID overload: prefer the (ulong) -> DXProject one.
+                BindingFlags all = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+                foreach (MethodInfo m in DxProjectType.GetMethods(all))
+                {
+                    if (m.Name != "FromID") continue;
+                    ParameterInfo[] ps = m.GetParameters();
+                    if (ps.Length == 1 && ps[0].ParameterType == typeof(ulong))
+                    {
+                        DxProjectFromIdMethod = m;
+                        break;
+                    }
+                }
+            }
+            if (DxProjectFromIdMethod != null)
+                Found("DXProject.FromID(ulong)", "public-stable-name", DxProjectFromIdMethod);
+            else
+                Log.Write("NOTE: DXProject.FromID not found; project diagnostics will skip the FromID probe.");
+
+            DxProjectLoadedProjectsField = DxProjectType.GetField("LoadedProjects", flags);
+            FoundOrNote("DXProject.LoadedProjects", DxProjectLoadedProjectsField);
+            DxProjectLastLoadedField = DxProjectType.GetField("LastLoaded", flags);
+            FoundOrNote("DXProject.LastLoaded", DxProjectLastLoadedField);
+            DxProjectSGameFilesField = DxProjectType.GetField("SGameFiles", flags);
+            FoundOrNote("DXProject.SGameFiles", DxProjectSGameFilesField);
+            DxProjectSGameDirectoryField = DxProjectType.GetField("SGameDirectory", flags);
+            FoundOrNote("DXProject.SGameDirectory", DxProjectSGameDirectoryField);
+        }
+
+        private void FoundOrNote(string purpose, FieldInfo f)
+        {
+            if (f != null) Found(purpose + " (static)", "public-stable-name", f);
+            else Log.Write("NOTE: " + purpose + " field not found; project diagnostics will skip it.");
         }
 
         private MethodInfo FindGeneratorOn(Type t)
@@ -1561,6 +1618,165 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
+        // DXProject diagnostics: read-only probe logged immediately before
+        // generation. The generator NREs at DXProject.FromID(...).EntityTemplates[...];
+        // these reads tell whether FromID returned null or the template map is
+        // null/empty. Never aborts.
+        // ---------------------------------------------------------------------
+        private static void LogProjectDiagnostics()
+        {
+            Log.Write("--- DXProject diagnostics (read-only, pre-generation) ---");
+
+            try
+            {
+                object current = ReadDxProjectCurrent();
+                Log.Write("DXPROJECT DXProject.Current: " +
+                          (current == null ? "null" : current.GetType().FullName));
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT DXProject.Current read FAILED: " + DescribeException(e));
+            }
+
+            try
+            {
+                FieldInfo f = refl.DxProjectLoadedProjectsField;
+                if (f == null)
+                {
+                    Log.Write("DXPROJECT DXProject.LoadedProjects: member not discovered");
+                }
+                else
+                {
+                    object loaded = f.GetValue(null);
+                    Log.Write("DXPROJECT DXProject.LoadedProjects: " +
+                              (loaded == null ? "null" : loaded.GetType().FullName));
+                    System.Collections.IDictionary dict = loaded as System.Collections.IDictionary;
+                    if (dict != null)
+                    {
+                        Log.Write("DXPROJECT DXProject.LoadedProjects Count=" + dict.Count);
+                        foreach (object key in dict.Keys)
+                            Log.Write("DXPROJECT LoadedProjects key: " + (key == null ? "null" : key.ToString()));
+                    }
+                    else if (loaded is System.Collections.ICollection)
+                    {
+                        Log.Write("DXPROJECT DXProject.LoadedProjects Count=" +
+                                  ((System.Collections.ICollection)loaded).Count +
+                                  " (not IDictionary; keys unavailable)");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT DXProject.LoadedProjects read FAILED: " + DescribeException(e));
+            }
+
+            LogDxProjectField("DXProject.LastLoaded", refl.DxProjectLastLoadedField);
+            LogDxProjectField("DXProject.SGameFiles", refl.DxProjectSGameFilesField);
+            LogDxProjectField("DXProject.SGameDirectory", refl.DxProjectSGameDirectoryField);
+
+            try
+            {
+                MethodInfo fromId = refl.DxProjectFromIdMethod;
+                if (fromId == null)
+                {
+                    Log.Write("DXPROJECT DXProject.FromID: member not discovered");
+                }
+                else
+                {
+                    object project = fromId.Invoke(null, new object[] { 7969835573169938409UL });
+                    Log.Write("DXPROJECT DXProject.FromID(7969835573169938409): " +
+                              (project == null ? "null" : project.GetType().FullName));
+                    if (project != null) LogDxProjectEntityTemplates(project);
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT DXProject.FromID probe FAILED: " + DescribeException(e));
+            }
+
+            Log.Write("--- end DXProject diagnostics ---");
+        }
+
+        private static void LogDxProjectField(string label, FieldInfo f)
+        {
+            try
+            {
+                if (f == null)
+                {
+                    Log.Write("DXPROJECT " + label + ": member not discovered");
+                    return;
+                }
+                object v = f.GetValue(null);
+                Log.Write("DXPROJECT " + label + ": " + DescribeValue(v));
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT " + label + " read FAILED: " + DescribeException(e));
+            }
+        }
+
+        private static void LogDxProjectEntityTemplates(object project)
+        {
+            try
+            {
+                Type t = project.GetType();
+                object templates = null;
+                PropertyInfo p = t.GetProperty("EntityTemplates",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (p != null)
+                {
+                    templates = p.GetValue(project, null);
+                }
+                else
+                {
+                    FieldInfo f = t.GetField("EntityTemplates",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (f == null)
+                    {
+                        Log.Write("DXPROJECT EntityTemplates: member not found on " + t.FullName);
+                        return;
+                    }
+                    templates = f.GetValue(project);
+                }
+                if (templates == null)
+                {
+                    Log.Write("DXPROJECT EntityTemplates: null");
+                    return;
+                }
+                System.Collections.ICollection col = templates as System.Collections.ICollection;
+                Log.Write("DXPROJECT EntityTemplates: " + templates.GetType().FullName +
+                          (col == null ? "" : " Count=" + col.Count));
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT EntityTemplates read FAILED: " + DescribeException(e));
+            }
+        }
+
+        private static object ReadDxProjectCurrent()
+        {
+            if (refl.DxProjectCurrentProp != null)
+                return refl.DxProjectCurrentProp.GetValue(null, null);
+            if (refl.DxProjectCurrentField != null)
+                return refl.DxProjectCurrentField.GetValue(null);
+            return null;
+        }
+
+        private static string DescribeValue(object v)
+        {
+            if (v == null) return "null";
+            if (v is string) return "string(\"" + v + "\")";
+            return v.GetType().FullName + "(" + v + ")";
+        }
+
+        private static string DescribeException(Exception e)
+        {
+            Exception root = e;
+            if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
+            return root.GetType().Name + ": " + root.Message;
+        }
+
+        // ---------------------------------------------------------------------
         // Signer validation: signature(file) must equal sibling .zxcheck content
         // ---------------------------------------------------------------------
         private static void ValidateSigner(string zxsavPath)
@@ -1677,6 +1893,8 @@ namespace Day0Gen
             refl.GetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p);
             refl.GetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p);
             refl.GetProp("params.Name", refl.ParamsType.GetProperty("Name"), p);
+
+            LogProjectDiagnostics();
 
             Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
             object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
