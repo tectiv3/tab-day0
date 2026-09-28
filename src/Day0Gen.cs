@@ -1117,6 +1117,12 @@ namespace Day0Gen
         private static GameReflector refl;
         private static volatile bool engineThreadDead;
 
+        // Stable id of the game's built-in project. The generator resolves its entity
+        // templates through DXProject.FromID(this), so a non-null result is the real
+        // prerequisite for generation (DXProject.Current alone becomes non-null too early,
+        // part-way through engine init).
+        private const ulong ProjectId = 7969835573169938409UL;
+
         private static int Main(string[] args)
         {
             int code = RunMain(args);
@@ -1561,60 +1567,99 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // Wait for the engine's scene/project context. ZXLevelState's ctor reads
-        // DXProject.Current (CurrentGeneratedLevel ?? DXProject.Current.LevelFromID(...)),
-        // which is only populated once the zombie engine finishes scene/project init.
+        // Wait for the engine's project context to be fully initialized.
+        //
+        // DXProject.Current becomes non-null part-way through engine init, so it is NOT
+        // a sufficient readiness signal: the generator later resolves entity templates via
+        // DXProject.FromID(ProjectId), which only succeeds once init has progressed further.
+        // Gate on FromID returning non-null; use Current for diagnosis only.
         // ---------------------------------------------------------------------
         private static void WaitForProjectContext()
         {
-            if (refl.DxProjectType == null ||
-                (refl.DxProjectCurrentProp == null && refl.DxProjectCurrentField == null))
-                throw new Day0GenException("DXProject.Current was not discovered; cannot verify engine " +
-                                           "scene/project init before construction.");
+            bool useFromId = refl.DxProjectFromIdMethod != null;
+            if (!useFromId &&
+                (refl.DxProjectType == null ||
+                 (refl.DxProjectCurrentProp == null && refl.DxProjectCurrentField == null)))
+                throw new Day0GenException("Neither DXProject.FromID nor DXProject.Current was discovered; " +
+                                           "cannot verify engine project init before construction.");
 
-            Log.Write("Waiting for DXProject.Current (engine scene/project context) ...");
+            if (useFromId)
+            {
+                Log.Write("Waiting for DXProject.FromID(" + ProjectId + ") != null (engine project-context " +
+                          "readiness; DXProject.Current alone is not sufficient) ...");
+            }
+            else
+            {
+                Log.Write("WARNING: DXProject.FromID was not discovered; falling back to the WEAKER readiness " +
+                          "signal DXProject.Current != null (it can become non-null before project init completes).");
+                Log.Write("Waiting for DXProject.Current (engine scene/project context) ...");
+            }
+
             DateTime deadline = DateTime.UtcNow.AddSeconds(90);
             int polls = 0;
             while (DateTime.UtcNow < deadline && !engineThreadDead)
             {
-                object current = null;
+                object ready = null;
+                string signal = useFromId ? "DXProject.FromID" : "DXProject.Current";
                 try
                 {
-                    // Prefer the property if present, otherwise read the field.
-                    if (refl.DxProjectCurrentProp != null)
-                        current = refl.DxProjectCurrentProp.GetValue(null, null);
+                    if (useFromId)
+                        ready = refl.DxProjectFromIdMethod.Invoke(null, new object[] { ProjectId });
                     else
-                        current = refl.DxProjectCurrentField.GetValue(null);
+                        ready = ReadDxProjectCurrent();
                 }
                 catch (Exception e)
                 {
                     Exception root = e;
                     if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
                     if (polls == 0)
-                        Log.Write("DXProject.Current getter threw (will keep polling): " +
+                        Log.Write(signal + " probe threw (will keep polling): " +
                                   root.GetType().Name + ": " + root.Message);
                 }
                 polls++;
-                if (current != null)
+                if (ready != null)
                 {
-                    Log.Write("DXProject.Current ready after " + polls + " poll(s): " + current.GetType().FullName);
+                    Log.Write(signal + " ready after " + polls + " poll(s): " + ready.GetType().FullName);
+                    LogCurrentProjectContextForDiagnosis();
                     return;
                 }
                 if (polls % 20 == 0)
                 {
                     int left = (int)(deadline - DateTime.UtcNow).TotalSeconds;
                     if (left < 0) left = 0;
-                    Log.Write("DXProject.Current still null (poll " + polls + ", ~" + left + "s left) ...");
+                    Log.Write(signal + " still null (poll " + polls + ", ~" + left + "s left) ...");
                 }
                 Thread.Sleep(500);
             }
 
             if (engineThreadDead)
-                Log.Write("Engine thread died before DXProject.Current became ready; stopping early.");
-            Log.Write("TIMEOUT: DXProject.Current remained null for ~90s; engine scene/project init did not complete.");
+                Log.Write("Engine thread died before project context became ready; stopping early.");
+            Log.Write("TIMEOUT: project context (DXProject.FromID/Current) remained null for ~90s; " +
+                      "engine project init did not complete.");
             DumpZxLogTail(EffectiveSavesDir(), 60);
-            throw new Day0GenException("Engine scene/project init did not complete: DXProject.Current was null " +
+            throw new Day0GenException("Engine project init did not complete: project context was null " +
                                        "after ~90s. See ZXLog tail above.");
+        }
+
+        // Read-only, log-only probe of DXProject.Current alongside the FromID readiness
+        // gate above. Never affects control flow.
+        private static void LogCurrentProjectContextForDiagnosis()
+        {
+            if (refl.DxProjectCurrentProp == null && refl.DxProjectCurrentField == null)
+            {
+                Log.Write("DXPROJECT (diagnostic) DXProject.Current: member not discovered");
+                return;
+            }
+            try
+            {
+                object current = ReadDxProjectCurrent();
+                Log.Write("DXPROJECT (diagnostic) DXProject.Current: " +
+                          (current == null ? "null" : current.GetType().FullName));
+            }
+            catch (Exception e)
+            {
+                Log.Write("DXPROJECT (diagnostic) DXProject.Current read FAILED: " + DescribeException(e));
+            }
         }
 
         // ---------------------------------------------------------------------
@@ -1683,8 +1728,8 @@ namespace Day0Gen
                 }
                 else
                 {
-                    object project = fromId.Invoke(null, new object[] { 7969835573169938409UL });
-                    Log.Write("DXPROJECT DXProject.FromID(7969835573169938409): " +
+                    object project = fromId.Invoke(null, new object[] { ProjectId });
+                    Log.Write("DXPROJECT DXProject.FromID(" + ProjectId + "): " +
                               (project == null ? "null" : project.GetType().FullName));
                     if (project != null) LogDxProjectEntityTemplates(project);
                 }
