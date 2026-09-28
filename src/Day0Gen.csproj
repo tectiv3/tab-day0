@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Minimal net48 console project used ONLY for local compile verification on
+       macOS via: nix shell nixpkgs#dotnet-sdk -c dotnet build -c Release
+       The operator compiles on Windows with in-box csc.exe (/langversion:5);
+       keep Day0Gen.cs strictly C# 5 and compile-time dependency-free (System only). -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>5</LangVersion>
+    <RootNamespace>Day0Gen</RootNamespace>
+    <AssemblyName>Day0Gen</AssemblyName>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>
