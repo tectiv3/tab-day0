@@ -52,15 +52,46 @@ The real DXVision assembly must be loaded (via the resolver) and used.
 ## Status / next steps
 
 - DONE: `RunModuleConstructor` fix implemented, local `make build` + `make audit` clean, exe
-  `c45c552f…` redeployed to the TAB dir (remote hash verified).
-- DONE: `--phase discovery` **completes** on target-host — all SPEC reflection targets found.
-- Next: `--phase zombie` (engine init + account read + password probe; optionally
-  `--validate-signer "…\Saves\COMMUNITY CHALLENGE.zxsav"` — read-only, expect `2.227699125761`),
-  then `--phase full` (generate + write + verify the new save). Deploy/run/verify/commits are the
-  main agent's job.
+  redeployed to the TAB dir (remote hash verified). Committed as `bc0b8f4`.
+- DONE (P0): `--phase discovery` **completes** on target-host — all SPEC reflection targets found.
+- DONE (P1): `--phase zombie --validate-signer "…\Saves\COMMUNITY CHALLENGE.zxsav"` **passes**.
+  Manager singleton ready; `GameAccount` readable; theme table initially threw
+  `ZXExceptionGameDataFilesCorrupted` but the engine table loader fixed it (6 themes on retry);
+  password machinery verified (flag=2, derived 57-char password on an existing save); signer
+  produced `2.227699125761` == on-disk `.zxcheck` → **Signer validation PASSED**. Engine
+  `ZX.Program.Main` throws a NullReferenceException in this zombie mode (expected — popup path).
+  Before/after SHA256 of the whole saves dir + root: **only `ZXLog.txt` changed**.
+- P2 (`--phase full`) — **in progress**, three bugs found and fixed (see below). Not yet succeeded.
+  Write target: `CC 550040233.zxsav` + `.zxcheck`. External before/after SHA256 confirmed only
+  `ZXLog.txt` changed across every attempt so far; **no save/account/CC file was ever touched**.
+
+## P2 — phase-full debugging arc (all fixed in code, live re-test pending)
+
+1. `new ZXGameState(name)` aborted with `TargetException: Non-static method requires a target`.
+   Cause: `GameReflector.Invoke` called `MethodBase.Invoke(target, args)` on a `ConstructorInfo`
+   (the two-arg form is invalid for ctors). Fix: special-case `if (m is ConstructorInfo)` →
+   `((ConstructorInfo)m).Invoke(args)`.
+2. `Activator.CreateInstance(ZXLevelState)` then failed with an opaque `TargetInvocationException`.
+   Added a logged `GameReflector.CreateInstance(purpose, type, args)` that unwraps/logs the inner
+   exception + stack, `LogExceptionChain` in `Main`, and forced `Environment.Exit(code)` at the end
+   (the zombie engine leaves foreground threads alive, so a normal return keeps the process/SSH open).
+3. **Abrupt `EXITCODE=0` right after the engine table loader.** Cause: `ZombieInit` invoked
+   `ZX.Program.Main` with OUR CLI args; the bootstrap treated that as a normal launch and handed
+   off to Steam (`Process.Start(...)` + `Environment.Exit`) — observed live: Steam started ~1.5 s
+   after the table loader, no save produced. **Ground truth: TABSAT passes `new string[] { "" }`**
+   (its method is `initialiseBillionsAndStall`) — an empty arg makes the engine settle at the
+   harmless error popup and STALL in-process. `SPEC.md`'s "TABSAT passes its own args" is WRONG.
+   Fix applied: invoke `Main` with `new string[] { "" }`.
+
+Live re-test of `--phase full` (interactive, via `run-day0-full.bat` in the TAB dir, run by the user)
+still pending at time of writing.
 
 ## Project memory / tooling
 
-- SSH: `ssh user@target-host` (PowerShell). scp is broken over it (PowerShell parses the `(x86)` path);
-  transfer binaries with a base64 pipe + `[IO.File]::WriteAllBytes`.
+- SSH: `ssh user@target-host` (PowerShell) or `user@target-host` over tailnet when mDNS is down. scp is
+  broken over it (PowerShell parses the `(x86)` path); transfer files with a base64 pipe +
+  `[IO.File]::WriteAllBytes`.
+- Running the engine in-process (`ZX.Program.Main`) must use `new string[] { "" }` (TABSAT parity),
+  NOT real args — real args cause a Steam handoff + process exit. Interactive runs (a `.bat` on the
+  user's desktop, `run-day0-full.bat`) behave differently from SSH session-0 runs.
 - Local build: `make build` (nix dotnet-sdk out-link `/tmp/dotnet-sdk-result`); `make audit` for C#5.

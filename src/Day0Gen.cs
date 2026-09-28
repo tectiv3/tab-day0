@@ -882,7 +882,10 @@ namespace Day0Gen
             object result;
             try
             {
-                result = m.Invoke(target, args);
+                if (m is ConstructorInfo)
+                    result = ((ConstructorInfo)m).Invoke(args);
+                else
+                    result = m.Invoke(target, args);
             }
             catch (Exception e)
             {
@@ -890,6 +893,29 @@ namespace Day0Gen
                 if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
                 Log.Write("INVOKE FAILED " + purpose + ": " + root.GetType().Name + ": " + root.Message);
                 throw new Day0GenException("Reflection invocation failed: " + purpose, root);
+            }
+            Log.Write("INVOKE OK " + purpose + " -> " + ShortResult(result));
+            return result;
+        }
+
+        // Constructor variant of Invoke: Activator wraps ctor exceptions in
+        // TargetInvocationException, so unwrap to the real inner exception before
+        // logging/throwing (otherwise the cause is lost).
+        public object CreateInstance(string purpose, Type t, params object[] args)
+        {
+            Log.Write("INVOKE " + purpose + " [new " + t.Name + "] args=(" + ArgsToString(args) + ")");
+            object result;
+            try
+            {
+                result = Activator.CreateInstance(t, args);
+            }
+            catch (Exception e)
+            {
+                Exception root = e;
+                if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
+                Log.Write("INVOKE FAILED " + purpose + ": " + root.GetType().Name + ": " + root.Message);
+                if (root.StackTrace != null) Log.Write(root.StackTrace);
+                throw new Day0GenException("Constructor invocation failed: " + purpose, root);
             }
             Log.Write("INVOKE OK " + purpose + " -> " + ShortResult(result));
             return result;
@@ -963,6 +989,15 @@ namespace Day0Gen
 
         private static int Main(string[] args)
         {
+            int code = RunMain(args);
+            // The zombie engine (ZX.Program.Main) leaves foreground threads alive, so a
+            // normal return can keep the process (and an SSH session) open. Force exit.
+            Environment.Exit(code);
+            return code; // unreachable: Environment.Exit terminates the process
+        }
+
+        private static int RunMain(string[] args)
+        {
             Log.Open();
             int pid;
             using (Process selfProc = Process.GetCurrentProcess()) { pid = selfProc.Id; }
@@ -995,10 +1030,23 @@ namespace Day0Gen
             }
             catch (Exception e)
             {
-                Log.Write("ABORT (unexpected): " + e.GetType().Name + ": " + e.Message);
-                Log.Write(e.StackTrace);
+                Log.Write("ABORT (unexpected): full exception chain follows.");
+                LogExceptionChain("ABORT", e);
                 Log.Write("=== Day0Gen FAILED (phase " + opts.Phase + ") ===");
                 return 1;
+            }
+        }
+
+        private static void LogExceptionChain(string label, Exception e)
+        {
+            int depth = 0;
+            Exception cur = e;
+            while (cur != null)
+            {
+                Log.Write(label + "[" + depth + "] " + cur.GetType().FullName + ": " + cur.Message);
+                if (cur.StackTrace != null) Log.Write(label + "[" + depth + "] stack: " + cur.StackTrace);
+                cur = cur.InnerException;
+                depth++;
             }
         }
 
@@ -1105,20 +1153,17 @@ namespace Day0Gen
 
         private static void ZombieInit()
         {
-            // Engine Main on background thread with our original args. The engine
-            // shows an error popup for unrecognized args - expected and harmless;
-            // minimize it like TABSAT does.
-            string[] engineArgs = Environment.GetCommandLineArgs();
-            // drop our own exe name; keep the rest verbatim
-            string[] pass = new string[engineArgs.Length - 1];
-            Array.Copy(engineArgs, 1, pass, 0, pass.Length);
-
+            // Match TABSAT's initialiseBillionsAndStall: pass a SINGLE EMPTY STRING.
+            // The engine reads that as an init-and-stall launch and parks at the harmless
+            // error popup, which we minimize. Real args make the bootstrap treat it as a
+            // normal launch and hand off to Steam (Process.Start + Environment.Exit),
+            // killing this process before any construction happens.
             Thread t = new Thread(delegate()
             {
                 try
                 {
                     Log.Write("Engine thread: invoking ZX.Program.Main ...");
-                    refl.MainMethod.Invoke(null, new object[] { pass });
+                    refl.MainMethod.Invoke(null, new object[] { new string[] { "" } });
                     Log.Write("Engine thread: Main returned.");
                 }
                 catch (Exception e)
@@ -1397,7 +1442,7 @@ namespace Day0Gen
             refl.SetProp("gs.GameMode=Survival", refl.GameStateType.GetProperty("GameMode"), gs,
                          Enum.Parse(refl.GameModeEnum, "Survival"));
 
-            object p = Activator.CreateInstance(refl.ParamsType);
+            object p = refl.CreateInstance("new ZXRandomLevelParams()", refl.ParamsType);
             Log.Write("Created ZXRandomLevelParams (defaults untouched except below).");
             refl.SetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p, opts.Seed);
             refl.SetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p, opts.NCells);
@@ -1411,7 +1456,7 @@ namespace Day0Gen
 
             refl.SetProp("gs.SurvivalModeParams", refl.GameStateType.GetProperty("SurvivalModeParams"), gs, p);
 
-            object ls = Activator.CreateInstance(refl.LevelStateType);
+            object ls = refl.CreateInstance("new ZXLevelState()", refl.LevelStateType);
             refl.Invoke("ZXLevelState.Set(ls)", refl.LevelStateSetMethod, null, ls);
             refl.Invoke("ZXLevelState.Init()", refl.LevelStateInitMethod, ls);
 

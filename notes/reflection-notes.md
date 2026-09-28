@@ -168,3 +168,22 @@ With this fix, `--phase discovery` completes on the target: every SPEC reflectio
 (manager, signer, password flag/setter/clearer, native save writer, saves-folder, save list,
 ZXGameState/ZXLevelState Set/Current/Init, ZXRandomLevelParams, generator, theme table + loader,
 game system + SetLevel, DXSystem.Load<T>, ZipSerializer.Read/Write, ZXFile<T> read).
+
+## 11. Phase `full` — three further bugs (fixed) before it can run
+
+1. `GameReflector.Invoke` called the two-arg `MethodBase.Invoke(target, args)` on a `ConstructorInfo`
+   (`ZXGameState(string)`), which throws `TargetException: Non-static method requires a target`.
+   Fixed: `if (m is ConstructorInfo) result = ((ConstructorInfo)m).Invoke(args);`.
+2. `Activator.CreateInstance` failures were logged only as the outer `TargetInvocationException`.
+   Added `GameReflector.CreateInstance(purpose, type, args)` (unwraps + logs inner type/message/stack),
+   `Program.LogExceptionChain`, and forced `Environment.Exit(code)` at the end of `Main` (the zombie
+   engine leaves foreground threads running, so a plain return kept the process/SSH alive).
+3. The engine process exited abruptly right after the theme-table loader. The bootstrap hands off to
+   Steam when given real command-line args (`Process.Start` + `Environment.Exit`) — observed: Steam
+   started ~1.5 s after the loader, no save written. **TABSAT passes `new string[] { "" }`**
+   (`initialiseBillionsAndStall`), which makes the engine settle at the harmless error popup and stall
+   in-process. `ZombieInit` now passes `new string[] { "" }` too. (SPEC's "TABSAT passes its own
+   args" was wrong.)
+
+Live re-test of `--phase full` pending. No save/account/CC file has ever been modified across any
+attempt (external before/after SHA256: only `ZXLog.txt` changed).
