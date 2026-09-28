@@ -9,7 +9,8 @@
 // save sequence must be marshaled onto the engine's UI thread (see
 // FindEngineUiMarshalTarget / RunConstructGenerateSave).
 //
-// Phases: discovery | zombie | full (later phases imply earlier ones).
+// Phases: discovery | zombie | genprobe (generator diagnostic) | full (later
+// phases imply earlier ones; genprobe is a read-only diagnostic, see RunGenProbe).
 
 using System;
 using System.Collections.Generic;
@@ -18,6 +19,7 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -73,7 +75,7 @@ namespace Day0Gen
     // ---------------------------------------------------------------------------
     internal sealed class Options
     {
-        public string Phase = null;                     // discovery | zombie | full
+        public string Phase = null;                     // discovery | zombie | genprobe | full
         public string TabDir = @"C:\Program Files (x86)\Steam\steamapps\common\They Are Billions";
         public string SavesDir = null;                  // null => default / manager-discovered
         public bool SavesDirExplicit = false;
@@ -116,10 +118,10 @@ namespace Day0Gen
                 i += 2;
             }
             if (o.Phase == null)
-                throw new Day0GenException("--phase discovery|zombie|full is required");
+                throw new Day0GenException("--phase discovery|zombie|genprobe|full is required");
             o.Phase = o.Phase.ToLowerInvariant();
-            if (o.Phase != "discovery" && o.Phase != "zombie" && o.Phase != "full")
-                throw new Day0GenException("Invalid --phase '" + o.Phase + "' (discovery|zombie|full)");
+            if (o.Phase != "discovery" && o.Phase != "zombie" && o.Phase != "genprobe" && o.Phase != "full")
+                throw new Day0GenException("Invalid --phase '" + o.Phase + "' (discovery|zombie|genprobe|full)");
             if (o.NCells < 64 || o.NCells > 512)
                 throw new Day0GenException("--ncells out of range [64,512]");
             if (o.Name == null || o.Name.Trim().Length == 0)
@@ -948,7 +950,7 @@ namespace Day0Gen
             return null;
         }
 
-        private static Type[] SafeGetTypes(Assembly asm)
+        internal static Type[] SafeGetTypes(Assembly asm)
         {
             try { return asm.GetTypes(); }
             catch (ReflectionTypeLoadException rtle)
@@ -1134,6 +1136,12 @@ namespace Day0Gen
         // part-way through engine init).
         private const ulong ProjectId = 7969835573169938409UL;
 
+        // Command-center entity template id (the generator's first CreateInstance:
+        // _0023_003DzYLpZK4K9zSHp._0023_003Dzyx9SpHmg_Pj8YUXUOQ_003D_003D._0023_003DzpMFG1rRDzbXO()
+        // resolves into DXProject.EntityTemplates under this key). Used only by the
+        // genprobe template-chain probe.
+        private const ulong GenProbeCommandCenterTemplateId = 3153977018683405164UL;
+
         private static int Main(string[] args)
         {
             int code = RunMain(args);
@@ -1175,6 +1183,7 @@ namespace Day0Gen
             {
                 if (opts.Phase == "discovery") return RunDiscovery();
                 if (opts.Phase == "zombie") return RunZombie();
+                if (opts.Phase == "genprobe") return RunGenProbe();
                 return RunFull();
             }
             catch (Day0GenException e)
@@ -1209,8 +1218,10 @@ namespace Day0Gen
 
         private static string Usage()
         {
-            return "Day0Gen --phase discovery|zombie|full [--tab-dir <dir>] [--saves-dir <dir>] [--seed N]\r\n"
-                 + "        [--ncells N] [--duration F] [--pop F] [--name S] [--validate-signer <zxsav>]";
+            return "Day0Gen --phase discovery|zombie|genprobe|full [--tab-dir <dir>] [--saves-dir <dir>] [--seed N]\r\n"
+                 + "        [--ncells N] [--duration F] [--pop F] [--name S] [--validate-signer <zxsav>]\r\n"
+                 + "        (genprobe: interactive generator diagnostic; zombie init + engine-UI-thread\r\n"
+                 + "         probe sequence; writes nothing besides Day0Gen.log)";
         }
 
         // ---------------------------------------------------------------------
@@ -1869,6 +1880,1038 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
+        // Phase: genprobe - runtime diagnostic for the generator NRE.
+        //
+        // The generator #=zEzgd90E=(ZXRandomLevelParams) dies ~120ms in with a
+        // STACKLESS NullReferenceException right after logging "Random Map Creation
+        // with seed". Every decompile-visible static checks out non-null, but the
+        // heavy lifting (DXWorldGrid / DXNoyseLayer / ZXMapDrawer / DXRandom weighted
+        // choice) lives in the embedded DXVision assembly, which cannot be
+        // decompiled locally - so the failure is localized empirically: a fixed probe
+        // sequence runs on the engine UI thread exactly like phase full, each step
+        // logging PASS/FAIL with its exception chain, and a FirstChanceException
+        // handler (registered before engine start) catches the NRE at throw time,
+        // when the CLR may still have a stack for it.
+        //
+        // Read-only phase: no directory snapshots, no save writes; the ONLY file this
+        // tool writes is Day0Gen.log (the engine keeps appending its own ZXLog.txt,
+        // same documented deviation as phase zombie).
+        // ---------------------------------------------------------------------
+        private static int RunGenProbe()
+        {
+            RefuseIfGameRunning();
+            VerifyTabDir();
+
+            // Early on the main thread, before the engine thread exists: FirstChanceException
+            // must be subscribed before the engine starts throwing.
+            RegisterFirstChanceHandler();
+
+            refl = new GameReflector();
+            refl.LoadAssemblies();
+            refl.DiscoverAll(false);
+
+            ZombieInit();               // includes account + theme table gates
+            ProbePasswordMachinery();
+            WaitForProjectContext();
+
+            Log.Write("GENPROBE: starting probe sequence on the engine UI thread; this phase writes " +
+                      "nothing besides Day0Gen.log (no snapshots, no save artifacts).");
+            try
+            {
+                RunOnEngineUiThread("genprobe sequence",
+                    "no artifacts are written by the genprobe phase; just collect Day0Gen.log.",
+                    delegate { GenProbeSequence(); });
+            }
+            finally
+            {
+                UnregisterFirstChanceHandler();
+                DumpZxLogTail(EffectiveSavesDir(), 25);
+            }
+            Log.Write("GENPROBE DONE");
+            Log.Write("=== Day0Gen OK (genprobe diagnostic sequence completed) ===");
+            return 0;
+        }
+
+        private static void GenProbeSequence()
+        {
+            Log.Write("GENPROBE: sequence starting on engine UI thread (thread id=" +
+                      Thread.CurrentThread.ManagedThreadId + ").");
+            ProbeStep("step1 theme pick (DXRandom + ChooseValueWithWeights)", delegate { GenProbeStep1Theme(); });
+            ProbeStep("step1b exact generator theme pick (instance ChooseValueWithWeights)",
+                     delegate { GenProbeStep1bThemeExact(); });
+            ProbeStep("step2 DXWorldGrid.Create", delegate { GenProbeStep2WorldGridCreate(); });
+            ProbeStep("step3 DXWorldGrid.GetSceneSquareArea", delegate { GenProbeStep3SceneSquareArea(); });
+            ProbeStep("step4 DXWorldGrid.ScenePointFromWorldCell", delegate { GenProbeStep4ScenePointFromWorldCell(); });
+            ProbeStep("step5 DXNoyseLayer op chain", delegate { GenProbeStep5NoyseLayer(); });
+            ProbeStep("step6 ZXMapDrawer layers", delegate { GenProbeStep6MapDrawer(); });
+            ProbeStep("step7 entity template chain", delegate { GenProbeStep7TemplateChain(); });
+            ProbeStep("step8 generator attempts", delegate { GenProbeStep8Generator(); });
+        }
+
+        // Wraps one probe step: PASS/FAIL + full exception chain; never aborts the
+        // remaining sequence (a FAIL is the diagnostic payload, not a stop signal).
+        private static void ProbeStep(string label, MethodInvoker op)
+        {
+            Log.Write("GENPROBE " + label + ": start");
+            try
+            {
+                op();
+                Log.Write("GENPROBE " + label + ": PASS");
+            }
+            catch (Exception e)
+            {
+                Log.Write("GENPROBE " + label + ": FAIL");
+                LogExceptionChain("GENPROBE " + label, e);
+            }
+        }
+
+        // Sub-operation inside a step (step5 chain): same logging, but returns
+        // success instead of throwing so later sub-operations still run.
+        private static bool ProbeOp(string label, MethodInvoker op)
+        {
+            try
+            {
+                op();
+                Log.Write("GENPROBE op " + label + ": PASS");
+                return true;
+            }
+            catch (Exception e)
+            {
+                Log.Write("GENPROBE op " + label + ": FAIL");
+                LogExceptionChain("GENPROBE op " + label, e);
+                return false;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // FirstChanceException diagnostic. The generator NRE is stackless by the
+        // time our catch block sees it; at throw time the CLR may still have frames.
+        // Filter: NullReferenceException / KeyNotFoundException / IndexOutOfRangeException
+        // whose stack mentions the generator class or the DXVision map types; stackless
+        // exceptions of those types are logged too (marked) - the stackless NRE is
+        // precisely the failure under investigation. Tiny + fully guarded: this runs
+        // on EVERY first-chance exception in the process until unregistered.
+        // ---------------------------------------------------------------------
+        private static EventHandler<FirstChanceExceptionEventArgs> genProbeFce;
+        private static int genProbeFceLogged;
+        private const int GenProbeFceLogLimit = 150;
+
+        private static void RegisterFirstChanceHandler()
+        {
+            genProbeFceLogged = 0;
+            genProbeFce = delegate(object sender, FirstChanceExceptionEventArgs e)
+            {
+                try
+                {
+                    if (genProbeFceLogged >= GenProbeFceLogLimit) return;
+                    Exception ex = e.Exception;
+                    if (ex == null) return;
+                    string tn = ex.GetType().Name;
+                    if (tn != "NullReferenceException" && tn != "KeyNotFoundException"
+                        && tn != "IndexOutOfRangeException") return;
+                    string st = ex.StackTrace;
+                    if (st == null || st.Length == 0)
+                    {
+                        genProbeFceLogged++;
+                        Log.Write("FCE: " + tn + ": " + ex.Message + " -- NO STACK (stackless)");
+                        LogFceDiagnostics(ex);
+                        return;
+                    }
+                    if (st.IndexOf("zyl_NPjjlA7DRfVtsRJCX1kN4BxSr", StringComparison.Ordinal) < 0
+                        && st.IndexOf("DXNoyseLayer", StringComparison.Ordinal) < 0
+                        && st.IndexOf("DXWorldGrid", StringComparison.Ordinal) < 0
+                        && st.IndexOf("ZXMapDrawer", StringComparison.Ordinal) < 0)
+                        return;
+                    genProbeFceLogged++;
+                    Log.Write("FCE: " + tn + ": " + ex.Message);
+                    Log.Write("FCE: stack: " + st);
+                    LogFceDiagnostics(ex);
+                }
+                catch { }
+            };
+            AppDomain.CurrentDomain.FirstChanceException += genProbeFce;
+            Log.Write("FCE handler registered (first-chance NRE/KeyNotFound/IndexOutOfRange filter, " +
+                      "generator + DXVision map-type stacks).");
+        }
+
+        // Second half of the FCE diagnostic (run for EVERY filtered exception,
+        // stackless or not): StackTrace(ex, true) is captured at throw time, when
+        // the runtime has already recorded the frames even though ex.StackTrace
+        // (the formatted string) is still empty - so the frame list with IL/native
+        // offsets is the decisive localization for the stackless generator NRE.
+        // GetILOffset() returns -1 (prints as 0xFFFFFFFF) for inlined/missing info;
+        // log whatever comes. TargetSite/Source/HResult follow. Every read is
+        // individually guarded: this runs inside the first-chance callback.
+        private static void LogFceDiagnostics(Exception ex)
+        {
+            try
+            {
+                StackTrace trace = new StackTrace(ex, true);
+                for (int i = 0; i < trace.FrameCount; i++)
+                {
+                    try
+                    {
+                        StackFrame f = trace.GetFrame(i);
+                        if (f == null)
+                        {
+                            Log.Write("FCE frame[" + i + "]: <null frame>");
+                            continue;
+                        }
+                        MethodBase m = null;
+                        try { m = f.GetMethod(); } catch { }
+                        string owner = "?";
+                        string mname = "?";
+                        if (m != null)
+                        {
+                            mname = m.Name;
+                            if (m.DeclaringType != null)
+                                owner = m.DeclaringType.FullName ?? m.DeclaringType.Name;
+                        }
+                        Log.Write("FCE frame: " + owner + "." + mname +
+                                  " IL=0x" + f.GetILOffset().ToString("X") +
+                                  " native=0x" + f.GetNativeOffset().ToString("X") +
+                                  " file=" + f.GetFileLineNumber());
+                    }
+                    catch (Exception fe)
+                    {
+                        Log.Write("FCE frame[" + i + "]: <read failed: " + fe.GetType().Name + ">");
+                    }
+                }
+                if (trace.FrameCount == 0)
+                    Log.Write("FCE: StackTrace(ex,true) captured 0 frame(s).");
+            }
+            catch (Exception e)
+            {
+                Log.Write("FCE: StackTrace(ex,true) build failed: " + e.GetType().Name + ": " + e.Message);
+            }
+            try
+            {
+                MethodBase ts = null;
+                try { ts = ex.TargetSite; } catch { }
+                if (ts == null)
+                {
+                    Log.Write("FCE TargetSite: null");
+                }
+                else
+                {
+                    StringBuilder sb = new StringBuilder();
+                    sb.Append("FCE TargetSite: ").Append(ts.Name);
+                    try { sb.Append(" MetadataToken=0x").Append(ts.MetadataToken.ToString("X")); }
+                    catch (Exception mte) { sb.Append(" MetadataToken=<").Append(mte.GetType().Name).Append(">"); }
+                    try
+                    {
+                        if (ts.DeclaringType != null)
+                            sb.Append(" DeclaringType=").Append(ts.DeclaringType.FullName ?? ts.DeclaringType.Name);
+                        else sb.Append(" DeclaringType=null");
+                    }
+                    catch (Exception dte) { sb.Append(" DeclaringType=<").Append(dte.GetType().Name).Append(">"); }
+                    Log.Write(sb.ToString());
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Write("FCE TargetSite: <read failed: " + e.GetType().Name + ">");
+            }
+            try { Log.Write("FCE Source: " + (ex.Source ?? "null")); }
+            catch (Exception e) { Log.Write("FCE Source: <read failed: " + e.GetType().Name + ">"); }
+            try { Log.Write("FCE HResult: 0x" + ex.HResult.ToString("X")); }
+            catch (Exception e) { Log.Write("FCE HResult: <read failed: " + e.GetType().Name + ">"); }
+        }
+
+        private static void UnregisterFirstChanceHandler()
+        {
+            if (genProbeFce != null)
+            {
+                AppDomain.CurrentDomain.FirstChanceException -= genProbeFce;
+                genProbeFce = null;
+                Log.Write("FCE handler unregistered (" + genProbeFceLogged + " event(s) logged, cap " +
+                          GenProbeFceLogLimit + ").");
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Probe steps. Types resolve via DxAssembly.GetType with TabAssembly
+        // fallback (or the reverse for ZX.* types); all method signatures are
+        // DISCOVERED at runtime and logged (DXVision is not decompilable locally,
+        // so the log becomes the signature catalog), and arguments are adapted to
+        // the discovered parameter types - never assumed.
+        // ---------------------------------------------------------------------
+        private static Type FindTypeAnyOrder(string fullName, Assembly first)
+        {
+            Type t = null;
+            try { t = first.GetType(fullName, false); } catch { }
+            if (t == null)
+            {
+                Assembly other = (first == refl.DxAssembly) ? refl.TabAssembly : refl.DxAssembly;
+                try { t = other.GetType(fullName, false); } catch { }
+            }
+            return t;
+        }
+
+        private static PropertyInfo FindPropertyUp(Type t, string name)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                PropertyInfo p = null;
+                try
+                {
+                    p = cur.GetProperty(name, BindingFlags.Instance | BindingFlags.Static |
+                                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (p != null) return p;
+            }
+            return null;
+        }
+
+        private static FieldInfo FindFieldUp(Type t, string name)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                FieldInfo f = null;
+                try
+                {
+                    f = cur.GetField(name, BindingFlags.Instance | BindingFlags.Static |
+                                           BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (f != null) return f;
+            }
+            return null;
+        }
+
+        private static string DescribeMethod(MethodBase m)
+        {
+            ParameterInfo[] ps = m.GetParameters();
+            StringBuilder sb = new StringBuilder();
+            MethodInfo mi = m as MethodInfo;
+            if (mi != null) sb.Append(mi.ReturnType.Name).Append(" ");
+            sb.Append(m.DeclaringType != null ? m.DeclaringType.FullName : "?");
+            sb.Append("::").Append(m.Name).Append("(");
+            for (int i = 0; i < ps.Length; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(ps[i].ParameterType.FullName != null ? ps[i].ParameterType.FullName : ps[i].ParameterType.Name);
+            }
+            sb.Append(")");
+            return sb.ToString();
+        }
+
+        // Adapts one boxed argument to a discovered parameter type (numeric width,
+        // enums, Point/PointF and Rectangle/RectangleF). Throws when no conversion
+        // exists, which callers treat as "overload does not fit - try the next".
+        private static object ConvertArg(object v, Type target)
+        {
+            Type tgt = target;
+            if (tgt.IsGenericType && tgt.GetGenericTypeDefinition() == typeof(Nullable<>))
+                tgt = tgt.GetGenericArguments()[0];
+            if (v == null) return null;
+            if (tgt.IsInstanceOfType(v)) return v;
+            if (tgt == typeof(int)) return Convert.ToInt32(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(long)) return Convert.ToInt64(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(short)) return Convert.ToInt16(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(byte)) return Convert.ToByte(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(uint)) return Convert.ToUInt32(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(ulong)) return Convert.ToUInt64(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(float)) return Convert.ToSingle(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(double)) return Convert.ToDouble(v, CultureInfo.InvariantCulture);
+            if (tgt == typeof(bool)) return Convert.ToBoolean(v, CultureInfo.InvariantCulture);
+            if (tgt.IsEnum) return Enum.ToObject(tgt, v);
+            if (tgt == typeof(System.Drawing.Point))
+            {
+                if (v is System.Drawing.PointF)
+                {
+                    System.Drawing.PointF pf = (System.Drawing.PointF)v;
+                    return new System.Drawing.Point((int)pf.X, (int)pf.Y);
+                }
+            }
+            if (tgt == typeof(System.Drawing.PointF))
+            {
+                if (v is System.Drawing.Point)
+                    return (System.Drawing.PointF)(System.Drawing.Point)v;
+            }
+            if (tgt == typeof(System.Drawing.Rectangle))
+            {
+                if (v is System.Drawing.RectangleF)
+                {
+                    System.Drawing.RectangleF rf = (System.Drawing.RectangleF)v;
+                    return new System.Drawing.Rectangle((int)rf.X, (int)rf.Y, (int)rf.Width, (int)rf.Height);
+                }
+            }
+            if (tgt == typeof(System.Drawing.RectangleF))
+            {
+                if (v is System.Drawing.Rectangle)
+                    return (System.Drawing.RectangleF)(System.Drawing.Rectangle)v;
+            }
+            throw new Day0GenException("cannot adapt " + v.GetType().Name + " to " + tgt.Name);
+        }
+
+        private static object[] AdaptArgs(string purpose, ParameterInfo[] ps, object[] args)
+        {
+            object[] adapted = new object[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+            {
+                try { adapted[i] = ConvertArg(args[i], ps[i].ParameterType); }
+                catch (Exception e)
+                {
+                    throw new Day0GenException(purpose + ": cannot adapt arg " + i + " (" +
+                        (args[i] == null ? "null" : args[i].GetType().Name) + " -> " +
+                        ps[i].ParameterType.Name + "): " + e.Message, e);
+                }
+            }
+            return adapted;
+        }
+
+        // Finds the best overload of `name` on `t` for `args` and invokes it.
+        // Prefers an exact parameter-type match; falls back to the first overload
+        // whose parameters ConvertArg can adapt the args to. Candidate signatures
+        // are always logged - DXVision shapes are only visible through this log.
+        private static object InvokeOn(string purpose, Type t, string name, bool wantStatic, object target, object[] args)
+        {
+            MethodInfo exact = null;
+            MethodInfo fallback = null;
+            MethodInfo[] methods;
+            try { methods = t.GetMethods(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic); }
+            catch (Exception e) { throw new Day0GenException("cannot enumerate methods on " + t.FullName + ": " + e.Message, e); }
+            foreach (MethodInfo m in methods)
+            {
+                if (m.Name != name || m.IsStatic != wantStatic) continue;
+                ParameterInfo[] ps = m.GetParameters();
+                if (ps.Length != args.Length) continue;
+                Log.Write("GENPROBE candidate " + DescribeMethod(m));
+                if (fallback == null) fallback = m;
+                if (exact == null)
+                {
+                    bool isExact = true;
+                    for (int i = 0; i < ps.Length; i++)
+                    {
+                        if (args[i] == null ? ps[i].ParameterType.IsValueType : ps[i].ParameterType != args[i].GetType())
+                        { isExact = false; break; }
+                    }
+                    if (isExact) exact = m;
+                }
+            }
+            MethodInfo chosen = exact != null ? exact : fallback;
+            if (chosen == null)
+                throw new Day0GenException("No overload of " + name + " with " + args.Length +
+                                           " parameter(s) found on " + t.FullName);
+            object[] adapted = AdaptArgs(purpose, chosen.GetParameters(), args);
+            Log.Write("GENPROBE invoking " + purpose + " via " + DescribeMethod(chosen));
+            return chosen.Invoke(target, adapted);
+        }
+
+        // Constructor twin of InvokeOn: tries every ctor whose arity matches,
+        // adapting arguments; logs every candidate signature.
+        private static object CreateWithAdaptedArgs(string purpose, Type t, object[] args)
+        {
+            Exception last = null;
+            ConstructorInfo[] ctors;
+            try { ctors = t.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance); }
+            catch (Exception e) { throw new Day0GenException("cannot enumerate ctors on " + t.FullName + ": " + e.Message, e); }
+            foreach (ConstructorInfo c in ctors)
+            {
+                Log.Write("GENPROBE ctor candidate " + DescribeMethod(c));
+                ParameterInfo[] ps = c.GetParameters();
+                if (ps.Length != args.Length) continue;
+                object[] adapted;
+                try { adapted = AdaptArgs(purpose, ps, args); }
+                catch (Day0GenException e) { last = e; continue; }
+                Log.Write("GENPROBE invoking " + purpose + " via " + DescribeMethod(c));
+                return c.Invoke(adapted);
+            }
+            throw new Day0GenException("No usable constructor with " + args.Length +
+                                       " parameter(s) on " + t.FullName, last);
+        }
+
+        // Weight callback for the reflected ChooseValueWithWeights<T> call: reads the
+        // theme's PW property. Bound with Delegate.CreateDelegate's relaxed parameter
+        // binding (Func<ZXMapTheme,float> accepts an (object)->float method).
+        private static float GenProbeThemeWeight(object theme)
+        {
+            try
+            {
+                PropertyInfo p = FindPropertyUp(theme.GetType(), "PW");
+                if (p != null)
+                    return Convert.ToSingle(p.GetValue(theme, null), CultureInfo.InvariantCulture);
+            }
+            catch { }
+            return 1f;
+        }
+
+        private static readonly MethodInfo genProbeWeightMethod = typeof(Program).GetMethod(
+            "GenProbeThemeWeight", BindingFlags.Static | BindingFlags.NonPublic);
+
+        private static void GenProbeStep1Theme()
+        {
+            // new DXRandom(seed)
+            Type dxRandomType = FindTypeAnyOrder("DXVision.DXRandom", refl.DxAssembly);
+            if (dxRandomType == null)
+                throw new Day0GenException("Type DXVision.DXRandom not found in either assembly");
+            object random = CreateWithAdaptedArgs("genprobe new DXRandom(seed)", dxRandomType,
+                                                 new object[] { opts.Seed });
+            Log.Write("GENPROBE step1: new DXRandom(" + opts.Seed + ") -> " + DescribeValue(random));
+
+            // theme table: Dictionary<ZXMapThemeType, ZXMapTheme> (6 entries)
+            object table = refl.Invoke("genprobe theme table", refl.ThemeTableMethod, null);
+            System.Collections.IDictionary dict = table as System.Collections.IDictionary;
+            if (dict == null)
+                throw new Day0GenException("Theme table is not a dictionary: " + DescribeValue(table));
+            PropertyInfo pwProp = FindPropertyUp(refl.MapThemeType, "PW");
+            PropertyInfo mtProp = FindPropertyUp(refl.MapThemeType, "MapThemeType");
+            object values = Activator.CreateInstance(typeof(List<>).MakeGenericType(refl.MapThemeType));
+            System.Collections.IList valuesList = (System.Collections.IList)values;
+            foreach (System.Collections.DictionaryEntry ent in dict)
+            {
+                object theme = ent.Value;
+                valuesList.Add(theme);
+                object pw = null;
+                if (pwProp != null)
+                {
+                    try { pw = pwProp.GetValue(theme, null); } catch (Exception e) { pw = "<" + e.GetType().Name + ">"; }
+                }
+                Log.Write("GENPROBE step1: theme " + ent.Key + " -> " +
+                          (theme == null ? "null" : theme.GetType().Name) + " PW=" + (pw == null ? "?" : pw.ToString()));
+            }
+            Log.Write("GENPROBE step1: theme table has " + dict.Count + " entr(ies); built List<" +
+                      refl.MapThemeType.Name + "> with " + valuesList.Count + " theme object(s).");
+
+            // ChooseValueWithWeights<T>: the generator calls it as a DXRandom extension
+            // with a Dictionary<ZXMapTheme,float>; the believed shape is
+            // (IEnumerable<T>, Func<T,float>). Discover ALL overloads, log their
+            // signatures, then adapt to whichever fits.
+            List<MethodInfo> chooseDefs = new List<MethodInfo>();
+            ScanChooseValueWithWeights(refl.DxAssembly, chooseDefs);
+            if (chooseDefs.Count == 0) ScanChooseValueWithWeights(refl.TabAssembly, chooseDefs);
+            if (chooseDefs.Count == 0)
+                throw new Day0GenException("No ChooseValueWithWeights<T> definition found in either assembly");
+
+            object chosen = null;
+            foreach (MethodInfo def in chooseDefs)
+            {
+                ParameterInfo[] ps = def.GetParameters();
+                if (ps.Length != 2 || !ps[1].ParameterType.IsGenericType
+                    || ps[1].ParameterType.GetGenericTypeDefinition() != typeof(Func<,>))
+                    continue;
+                Type[] wa = ps[1].ParameterType.GetGenericArguments();
+                if (wa.Length != 2 || wa[1] != typeof(float) || !wa[0].IsGenericParameter)
+                    continue;
+                try
+                {
+                    MethodInfo closed = def.MakeGenericMethod(refl.MapThemeType);
+                    ParameterInfo[] cps = closed.GetParameters();
+                    if (!cps[0].ParameterType.IsInstanceOfType(values))
+                    {
+                        Log.Write("GENPROBE step1: NOTE: " + DescribeMethod(closed) +
+                                  " param0 rejects List<ZXMapTheme>; trying next overload");
+                        continue;
+                    }
+                    if (genProbeWeightMethod == null)
+                        throw new Day0GenException("GenProbeThemeWeight method not resolvable");
+                    object weightFn = Delegate.CreateDelegate(cps[1].ParameterType, genProbeWeightMethod);
+                    chosen = closed.Invoke(null, new object[] { random, values, weightFn });
+                    Log.Write("GENPROBE step1: invoked " + DescribeMethod(closed) + " (extension; random as arg0)");
+                }
+                catch (Exception e)
+                {
+                    Log.Write("GENPROBE step1: ChooseValueWithWeights overload failed: " + DescribeException(e));
+                }
+                if (chosen != null) break;
+            }
+
+            if (chosen == null)
+            {
+                // Fallback: 1-arg Dictionary<T,float> form (what the generator's own
+                // call-site passes).
+                foreach (MethodInfo def in chooseDefs)
+                {
+                    ParameterInfo[] ps = def.GetParameters();
+                    if (ps.Length != 1 || !ps[0].ParameterType.IsGenericType) continue;
+                    Type g = ps[0].ParameterType.GetGenericTypeDefinition();
+                    if (g != typeof(Dictionary<,>) && g != typeof(System.Collections.Generic.IDictionary<,>)) continue;
+                    Type[] ga = ps[0].ParameterType.GetGenericArguments();
+                    if (ga.Length != 2 || ga[1] != typeof(float) || !ga[0].IsGenericParameter) continue;
+                    try
+                    {
+                        MethodInfo closed = def.MakeGenericMethod(refl.MapThemeType);
+                        object wdict = Activator.CreateInstance(
+                            typeof(Dictionary<,>).MakeGenericType(refl.MapThemeType, typeof(float)));
+                        System.Collections.IDictionary wdictIface = (System.Collections.IDictionary)wdict;
+                        foreach (System.Collections.DictionaryEntry ent in dict)
+                        {
+                            if (pwProp == null) break;
+                            wdictIface.Add(ent.Value, Convert.ToSingle(pwProp.GetValue(ent.Value, null),
+                                                                     CultureInfo.InvariantCulture));
+                        }
+                        chosen = closed.Invoke(null, new object[] { random, wdict });
+                        Log.Write("GENPROBE step1: invoked " + DescribeMethod(closed) + " (extension; random as arg0)");
+                    }
+                    catch (Exception e)
+                    {
+                        Log.Write("GENPROBE step1: ChooseValueWithWeights dictionary overload failed: " +
+                                  DescribeException(e));
+                    }
+                    if (chosen != null) break;
+                }
+            }
+
+            if (chosen == null)
+                throw new Day0GenException("ChooseValueWithWeights: no usable overload among " +
+                                           chooseDefs.Count + " candidate(s) logged above");
+            string mt = "?";
+            if (mtProp != null)
+            {
+                try { object mtv = mtProp.GetValue(chosen, null); mt = mtv == null ? "null" : mtv.ToString(); } catch { }
+            }
+            Log.Write("GENPROBE step1: chosen theme = " + DescribeValue(chosen) +
+                      " (MapThemeType=" + mt + ")");
+        }
+
+        private static void ScanChooseValueWithWeights(Assembly asm, List<MethodInfo> found)
+        {
+            foreach (Type t in GameReflector.SafeGetTypes(asm))
+            {
+                if (t == null) continue;
+                MethodInfo[] ms;
+                try { ms = t.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic); }
+                catch { continue; }
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name != "ChooseValueWithWeights" || !m.IsGenericMethodDefinition) continue;
+                    found.Add(m);
+                    Log.Write("GENPROBE step1: ChooseValueWithWeights definition on " +
+                              (t.FullName ?? t.Name) + ": " + DescribeMethod(m));
+                }
+            }
+        }
+
+        // Step 1b: replicate the generator's theme pick EXACTLY (decompiled
+        // `--zyl_...cs` lines ~84-95):
+        //   DXRandom val = new DXRandom(params.Seed);
+        //   List<ZXMapThemeType> { BR, AL, TM, DS, FA, VO };
+        //   val.ChooseValueWithWeights<ZXMapTheme>(source.ToDictionary(
+        //       k => table[k], k => table[k].PW));
+        // Metadata shows ChooseValueWithWeights is an INSTANCE method on
+        // DXVision.DXRandom (MemberRef DXRandom::ChooseValueWithWeights, generic,
+        // 1 arg Dictionary<T,float>) - step 1's static-extension scan cannot see
+        // it, so this step drives the instance method directly with a reflected
+        // Dictionary<ZXMapTheme,float>.
+        private static void GenProbeStep1bThemeExact()
+        {
+            Type dxRandomType = FindTypeAnyOrder("DXVision.DXRandom", refl.DxAssembly);
+            if (dxRandomType == null)
+                throw new Day0GenException("Type DXVision.DXRandom not found in either assembly");
+            object random = CreateWithAdaptedArgs("genprobe1b new DXRandom(seed)", dxRandomType,
+                                                 new object[] { opts.Seed });
+            Log.Write("GENPROBE step1b: new DXRandom(" + opts.Seed + ") -> " + DescribeValue(random));
+
+            object table = refl.Invoke("genprobe1b theme table", refl.ThemeTableMethod, null);
+            System.Collections.IDictionary dict = table as System.Collections.IDictionary;
+            if (dict == null)
+                throw new Day0GenException("Theme table is not a dictionary: " + DescribeValue(table));
+            PropertyInfo pwProp = FindPropertyUp(refl.MapThemeType, "PW");
+            if (pwProp == null)
+                throw new Day0GenException("ZXMapTheme.PW property not found");
+            PropertyInfo mtProp = FindPropertyUp(refl.MapThemeType, "MapThemeType");
+
+            // List<ZXMapThemeType> { BR, AL, TM, DS, FA, VO } - generator's key list;
+            // its order fixes the Dictionary insertion order of the real call.
+            string[] keyNames = new string[] { "BR", "AL", "TM", "DS", "FA", "VO" };
+            object keys = Activator.CreateInstance(typeof(List<>).MakeGenericType(refl.MapThemeEnum));
+            System.Collections.IList keyList = (System.Collections.IList)keys;
+            foreach (string kn in keyNames)
+                keyList.Add(Enum.Parse(refl.MapThemeEnum, kn));
+            Log.Write("GENPROBE step1b: built List<" + refl.MapThemeEnum.Name + "> with " +
+                      keyList.Count + " key(s) (BR,AL,TM,DS,FA,VO).");
+
+            // source.ToDictionary(k => table[k], k => table[k].PW) via reflection:
+            // Dictionary<ZXMapTheme,float>, key = the theme OBJECT, value = its PW.
+            Type wdictType = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeType, typeof(float));
+            object wdict = Activator.CreateInstance(wdictType);
+            System.Collections.IDictionary wdictIface = (System.Collections.IDictionary)wdict;
+            foreach (object k in keyList)
+            {
+                object theme = dict[k];
+                if (theme == null)
+                    throw new Day0GenException("theme table[" + k + "] is null");
+                float pw = Convert.ToSingle(pwProp.GetValue(theme, null), CultureInfo.InvariantCulture);
+                wdictIface.Add(theme, pw);
+                Log.Write("GENPROBE step1b: dict.Add(table[" + k + "]) key=" + DescribeValue(theme) +
+                          " PW=" + pw.ToString("R", CultureInfo.InvariantCulture));
+            }
+            Log.Write("GENPROBE step1b: built " + wdictType.FullName + " with " + wdictIface.Count +
+                      " entr(ies).");
+
+            // Find ChooseValueWithWeights on the DXRandom type - INSTANCE method per
+            // metadata, but scan instance+static to be safe. Pick the generic
+            // definition whose single parameter is IDictionary/Dictionary/generic-
+            // IEnumerable-compatible.
+            MethodInfo chosenDef = null;
+            MethodInfo[] ms;
+            try { ms = dxRandomType.GetMethods(BindingFlags.Instance | BindingFlags.Static |
+                                              BindingFlags.Public | BindingFlags.NonPublic); }
+            catch (Exception e) { throw new Day0GenException("cannot enumerate methods on DXVision.DXRandom: " + e.Message, e); }
+            foreach (MethodInfo m in ms)
+            {
+                if (m.Name != "ChooseValueWithWeights" || !m.IsGenericMethodDefinition) continue;
+                Log.Write("GENPROBE step1b: ChooseValueWithWeights candidate " + DescribeMethod(m) +
+                          (m.IsStatic ? " (static)" : " (instance)"));
+                ParameterInfo[] ps = m.GetParameters();
+                if (ps.Length != 1) continue;
+                if (!IsDictionaryLikeParameter(ps[0].ParameterType)) continue;
+                if (chosenDef == null || (chosenDef.IsStatic && !m.IsStatic)) chosenDef = m;
+            }
+            if (chosenDef == null)
+                throw new Day0GenException("No ChooseValueWithWeights<T> with a single dictionary-like " +
+                                           "parameter found on " + dxRandomType.FullName);
+            Log.Write("GENPROBE step1b: picked " + DescribeMethod(chosenDef) +
+                      (chosenDef.IsStatic ? " (static)" : " (instance)"));
+
+            MethodInfo closed = chosenDef.MakeGenericMethod(refl.MapThemeType);
+            ParameterInfo[] cps = closed.GetParameters();
+            if (!cps[0].ParameterType.IsInstanceOfType(wdict))
+                throw new Day0GenException("Closed parameter " + cps[0].ParameterType.FullName +
+                                           " rejects the reflected dictionary " + wdict.GetType().FullName);
+            Log.Write("GENPROBE step1b: invoking " + DescribeMethod(closed) +
+                      " on the DXRandom instance with the dictionary ...");
+            try
+            {
+                object chosenTheme = closed.Invoke(random, new object[] { wdict });
+                Log.Write("GENPROBE step1b: chosen theme = " + DescribeValue(chosenTheme));
+                string mt = "?";
+                if (mtProp != null)
+                {
+                    try
+                    {
+                        object mtv = mtProp.GetValue(chosenTheme, null);
+                        mt = mtv == null ? "null" : mtv.ToString();
+                    }
+                    catch (Exception e) { mt = "<" + e.GetType().Name + ">"; }
+                }
+                Log.Write("GENPROBE step1b: theme MapThemeType=" + mt);
+            }
+            catch (Exception e)
+            {
+                LogExceptionChain("GENPROBE step1b invoke", e);
+                throw;
+            }
+        }
+
+        // True when `pt` can receive the generator's Dictionary<T,float> argument:
+        // the closed generic itself, its open definition Dictionary<,>/IDictionary<,>/
+        // IEnumerable<> and friends, or the non-generic IDictionary/IEnumerable.
+        private static bool IsDictionaryLikeParameter(Type pt)
+        {
+            if (pt == null) return false;
+            try { if (pt == typeof(System.Collections.IDictionary)) return true; } catch { }
+            try { if (pt == typeof(System.Collections.IEnumerable)) return true; } catch { }
+            if (!pt.IsGenericType) return false;
+            try
+            {
+                Type g = pt.GetGenericTypeDefinition();
+                return g == typeof(Dictionary<,>)
+                    || g == typeof(System.Collections.Generic.IDictionary<,>)
+                    || g == typeof(System.Collections.Generic.IReadOnlyDictionary<,>)
+                    || g == typeof(IEnumerable<>)
+                    || g == typeof(ICollection<>);
+            }
+            catch { return false; }
+        }
+
+        private static void GenProbeStep2WorldGridCreate()
+        {
+            Type gridType = FindTypeAnyOrder("DXVision.DXWorldGrid", refl.DxAssembly);
+            if (gridType == null)
+                throw new Day0GenException("Type DXVision.DXWorldGrid not found in either assembly");
+            object result = InvokeOn("genprobe DXWorldGrid.Create", gridType, "Create", true, null,
+                                     new object[] { opts.NCells, 0, 0, false });
+            Log.Write("GENPROBE step2: DXWorldGrid.Create(" + opts.NCells + ",0,0,false) -> " +
+                      DescribeValue(result));
+        }
+
+        private static void GenProbeStep3SceneSquareArea()
+        {
+            Type gridType = FindTypeAnyOrder("DXVision.DXWorldGrid", refl.DxAssembly);
+            if (gridType == null)
+                throw new Day0GenException("Type DXVision.DXWorldGrid not found in either assembly");
+            object result = InvokeOn("genprobe DXWorldGrid.GetSceneSquareArea", gridType,
+                                     "GetSceneSquareArea", true, null, new object[] { opts.NCells, 1f });
+            Log.Write("GENPROBE step3: DXWorldGrid.GetSceneSquareArea(" + opts.NCells + ",1) -> " +
+                      DescribeValue(result));
+        }
+
+        private static void GenProbeStep4ScenePointFromWorldCell()
+        {
+            Type gridType = FindTypeAnyOrder("DXVision.DXWorldGrid", refl.DxAssembly);
+            if (gridType == null)
+                throw new Day0GenException("Type DXVision.DXWorldGrid not found in either assembly");
+            int half = opts.NCells / 2;
+            object result = InvokeOn("genprobe DXWorldGrid.ScenePointFromWorldCell", gridType,
+                                     "ScenePointFromWorldCell", true, null, new object[] { half, half });
+            Log.Write("GENPROBE step4: DXWorldGrid.ScenePointFromWorldCell(" + half + "," + half + ") -> " +
+                      DescribeValue(result));
+        }
+
+        private static void GenProbeStep5NoyseLayer()
+        {
+            Type layerType = FindTypeAnyOrder("DXVision.DXNoyseLayer", refl.DxAssembly);
+            if (layerType == null)
+                throw new Day0GenException("Type DXVision.DXNoyseLayer not found in either assembly");
+            object layer = CreateWithAdaptedArgs("genprobe new DXNoyseLayer(n)", layerType,
+                                                new object[] { opts.NCells });
+            Log.Write("GENPROBE step5: new DXNoyseLayer(" + opts.NCells + ") -> " + DescribeValue(layer));
+
+            object cloneHolder = null;
+            List<string> failures = new List<string>();
+
+            if (!ProbeOp("step5 FillWithNoyse(100,0.03,0.03,200,300,2)", delegate
+            {
+                InvokeOn("genprobe FillWithNoyse", layerType, "FillWithNoyse", false, layer,
+                         new object[] { 100.0, 0.03, 0.03, 200.0, 300.0, 2 });
+            })) failures.Add("FillWithNoyse");
+
+            if (!ProbeOp("step5 Clone()", delegate
+            {
+                cloneHolder = InvokeOn("genprobe Clone", layerType, "Clone", false, layer, new object[0]);
+            })) failures.Add("Clone");
+
+            if (!ProbeOp("step5 Substract(clone)", delegate
+            {
+                if (cloneHolder == null) throw new Day0GenException("no clone from previous op");
+                InvokeOn("genprobe Substract", layerType, "Substract", false, layer,
+                         new object[] { cloneHolder });
+            })) failures.Add("Substract");
+
+            if (!ProbeOp("step5 MultiplyWith(clone)", delegate
+            {
+                if (cloneHolder == null) throw new Day0GenException("no clone from previous op");
+                InvokeOn("genprobe MultiplyWith", layerType, "MultiplyWith", false, layer,
+                         new object[] { cloneHolder });
+            })) failures.Add("MultiplyWith");
+
+            if (!ProbeOp("step5 SetContrast(2.0)", delegate
+            {
+                InvokeOn("genprobe SetContrast", layerType, "SetContrast", false, layer, new object[] { 2.0 });
+            })) failures.Add("SetContrast");
+
+            if (!ProbeOp("step5 TruncateTo01(0.5,1)", delegate
+            {
+                InvokeOn("genprobe TruncateTo01", layerType, "TruncateTo01", false, layer,
+                         new object[] { 0.5, 1 });
+            })) failures.Add("TruncateTo01");
+
+            if (!ProbeOp("step5 GetAreaNearPoint(half,half,8,8,1.0)", delegate
+            {
+                object r = InvokeOn("genprobe GetAreaNearPoint", layerType, "GetAreaNearPoint", false,
+                                    layer, new object[] { opts.NCells / 2, opts.NCells / 2, 8, 8, 1.0 });
+                Log.Write("GENPROBE step5: GetAreaNearPoint -> " + DescribeValue(r));
+            })) failures.Add("GetAreaNearPoint");
+
+            if (!ProbeOp("step5 GetTotalValueOnArea(FromCenter rect)", delegate
+            {
+                object rect = GenProbeBuildFromCenterRect();
+                if (rect == null)
+                {
+                    Log.Write("GENPROBE step5: SKIP GetTotalValueOnArea - no usable FromCenter(point,w,h) found");
+                    return;
+                }
+                object total = InvokeOn("genprobe GetTotalValueOnArea", layerType, "GetTotalValueOnArea",
+                                        false, layer, new object[] { rect });
+                Log.Write("GENPROBE step5: GetTotalValueOnArea -> " + DescribeValue(total));
+            })) failures.Add("GetTotalValueOnArea");
+
+            if (failures.Count > 0)
+                throw new Day0GenException("DXNoyseLayer sub-ops failed: " +
+                                           string.Join(", ", failures.ToArray()));
+        }
+
+        // Builds the Rectangle argument for GetTotalValueOnArea via
+        // DXExtensions_Rectangle / DXHelper_Rectangle.FromCenter (whichever exists
+        // with an invocable shape). Returns null when neither is usable; the caller
+        // then logs SKIP instead of failing the step.
+        private static object GenProbeBuildFromCenterRect()
+        {
+            object center = new System.Drawing.Point(opts.NCells / 2, opts.NCells / 2);
+            Type[] helperTypes = new Type[]
+            {
+                FindTypeAnyOrder("DXVision.DXExtensions_Rectangle", refl.DxAssembly),
+                FindTypeAnyOrder("DXVision.DXHelper_Rectangle", refl.DxAssembly)
+            };
+            foreach (Type ht in helperTypes)
+            {
+                if (ht == null) continue;
+                MethodInfo[] ms;
+                try { ms = ht.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic); }
+                catch { continue; }
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name != "FromCenter") continue;
+                    ParameterInfo[] ps = m.GetParameters();
+                    Log.Write("GENPROBE candidate " + DescribeMethod(m));
+                    if (ps.Length != 2 && ps.Length != 3) continue;
+                    try
+                    {
+                        object[] args = ps.Length == 3
+                            ? new object[] { center, 8, 8 }
+                            : new object[] { center, 8 };
+                        object rect = m.Invoke(null, AdaptArgs("genprobe FromCenter", ps, args));
+                        Log.Write("GENPROBE step5: FromCenter -> " + DescribeValue(rect));
+                        return rect;
+                    }
+                    catch (Exception e)
+                    {
+                        Log.Write("GENPROBE step5: FromCenter candidate failed: " + DescribeException(e));
+                    }
+                }
+            }
+            return null;
+        }
+
+        private static void GenProbeStep6MapDrawer()
+        {
+            Type drawerType = FindTypeAnyOrder("ZX.GameSystems.ZXMapDrawer", refl.TabAssembly);
+            if (drawerType == null)
+                throw new Day0GenException("Type ZX.GameSystems.ZXMapDrawer not found in either assembly");
+            object drawer = CreateWithAdaptedArgs("genprobe new ZXMapDrawer(n)", drawerType,
+                                                 new object[] { opts.NCells });
+            Log.Write("GENPROBE step6: new ZXMapDrawer(" + opts.NCells + ") -> " + DescribeValue(drawer));
+            string[] propNames = new string[] { "LayerTerrain", "LayerObjects", "ExtraEntities" };
+            foreach (string pn in propNames)
+            {
+                PropertyInfo p = FindPropertyUp(drawerType, pn);
+                if (p == null)
+                {
+                    Log.Write("GENPROBE step6: ZXMapDrawer." + pn + ": property not found");
+                    continue;
+                }
+                try
+                {
+                    object val = p.GetValue(drawer, null);
+                    Log.Write("GENPROBE step6: ZXMapDrawer." + pn + " = " + DescribeValue(val));
+                }
+                catch (Exception e)
+                {
+                    Log.Write("GENPROBE step6: ZXMapDrawer." + pn + " read FAILED: " + DescribeException(e));
+                }
+            }
+        }
+
+        private static void GenProbeStep7TemplateChain()
+        {
+            if (refl.DxProjectFromIdMethod == null)
+                throw new Day0GenException("DXProject.FromID was not discovered");
+            object project = refl.DxProjectFromIdMethod.Invoke(null, new object[] { ProjectId });
+            if (project == null)
+                throw new Day0GenException("DXProject.FromID(" + ProjectId + ") returned null");
+            Log.Write("GENPROBE step7: DXProject.FromID(" + ProjectId + ") -> " + DescribeValue(project));
+
+            PropertyInfo etProp = FindPropertyUp(project.GetType(), "EntityTemplates");
+            object templates;
+            if (etProp != null)
+            {
+                templates = etProp.GetValue(project, null);
+            }
+            else
+            {
+                FieldInfo etField = FindFieldUp(project.GetType(), "EntityTemplates");
+                if (etField == null)
+                    throw new Day0GenException("DXProject.EntityTemplates member not found");
+                templates = etField.GetValue(project);
+            }
+            System.Collections.IDictionary td = templates as System.Collections.IDictionary;
+            if (td == null)
+                throw new Day0GenException("EntityTemplates is not IDictionary: " + DescribeValue(templates));
+            Log.Write("GENPROBE step7: EntityTemplates type=" + templates.GetType().FullName +
+                      " Count=" + td.Count);
+
+            bool has = td.Contains(GenProbeCommandCenterTemplateId);
+            Log.Write("GENPROBE step7: ContainsKey(" + GenProbeCommandCenterTemplateId + ") = " + has);
+            object template = td[GenProbeCommandCenterTemplateId];
+            if (template == null)
+                throw new Day0GenException("EntityTemplates[" + GenProbeCommandCenterTemplateId + "] is null");
+            Log.Write("GENPROBE step7: template = " + DescribeValue(template));
+
+            MethodInfo ci = null;
+            foreach (MethodInfo m in template.GetType().GetMethods(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (m.Name != "CreateInstance") continue;
+                Log.Write("GENPROBE step7 candidate " + DescribeMethod(m));
+                ParameterInfo[] ps = m.GetParameters();
+                if (ps.Length == 1 && ps[0].ParameterType.Name == "DXRandom") ci = m;
+            }
+            if (ci == null)
+                throw new Day0GenException("DXEntityTemplate.CreateInstance(DXRandom) not found");
+            object entity = ci.Invoke(template, new object[] { null });
+            Log.Write("GENPROBE step7: CreateInstance(null) -> " + DescribeValue(entity));
+
+            PropertyInfo cellProp = FindPropertyUp(entity.GetType(), "Cell");
+            if (cellProp == null)
+                throw new Day0GenException("DXEntity.Cell property not found");
+            object cell = new System.Drawing.Point(opts.NCells / 2, opts.NCells / 2);
+            cellProp.SetValue(entity, ConvertArg(cell, cellProp.PropertyType), null);
+            Log.Write("GENPROBE step7: entity.Cell = " + DescribeValue(cellProp.GetValue(entity, null)));
+
+            PropertyInfo nameProp = FindPropertyUp(entity.GetType(), "Name");
+            string nm = "(no Name property)";
+            if (nameProp != null)
+            {
+                try
+                {
+                    object nv = nameProp.GetValue(entity, null);
+                    nm = nv == null ? "null" : nv.ToString();
+                }
+                catch (Exception e) { nm = "<" + e.GetType().Name + ">"; }
+            }
+            Log.Write("GENPROBE step7: entity type=" + entity.GetType().FullName + " Name=" + nm);
+        }
+
+        private static void GenProbeStep8Generator()
+        {
+            int[] waits = new int[] { 0, 5, 10 };   // seconds to sleep BEFORE attempts 2 and 3
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                if (waits[attempt - 1] > 0)
+                {
+                    Log.Write("GENPROBE step8: sleeping " + waits[attempt - 1] +
+                              "s before attempt " + attempt + " ...");
+                    Thread.Sleep(waits[attempt - 1] * 1000);
+                }
+                object p = refl.CreateInstance("genprobe new ZXRandomLevelParams() (attempt " + attempt + ")",
+                                               refl.ParamsType);
+                refl.SetProp("genprobe params.Seed", refl.ParamsType.GetProperty("Seed"), p, opts.Seed);
+                refl.SetProp("genprobe params.NCells", refl.ParamsType.GetProperty("NCells"), p, opts.NCells);
+                refl.SetProp("genprobe params.ThemeType=None", refl.ParamsType.GetProperty("ThemeType"), p,
+                             Enum.Parse(refl.MapThemeEnum, "None"));
+                refl.SetProp("genprobe params.FactorGameDuration",
+                             refl.ParamsType.GetProperty("FactorGameDuration"), p, opts.Duration);
+                refl.SetProp("genprobe params.FactorZombiePopulation",
+                             refl.ParamsType.GetProperty("FactorZombiePopulation"), p, opts.Pop);
+                refl.SetProp("genprobe params.Name", refl.ParamsType.GetProperty("Name"), p, "probe");
+                Log.Write("GENPROBE step8: attempt " + attempt + " - invoking generator (Seed=" + opts.Seed +
+                          ", NCells=" + opts.NCells + ", ThemeType=None, Duration=" + opts.Duration +
+                          ", Pop=" + opts.Pop + ", Name=probe) ...");
+                try
+                {
+                    object level = refl.Invoke("genprobe generator(params) attempt " + attempt,
+                                              refl.GenerateMethod, null, p);
+                    if (level != null)
+                    {
+                        Log.Write("GENPROBE step8: SUCCESS on attempt " + attempt +
+                                  " - generator returned " + level.GetType().FullName);
+                        return;
+                    }
+                    Log.Write("GENPROBE step8: attempt " + attempt + " returned a NULL level.");
+                }
+                catch (Day0GenException e)
+                {
+                    Log.Write("GENPROBE step8: attempt " + attempt + " threw: " + e.Message);
+                    LogExceptionChain("GENPROBE step8 attempt " + attempt, e);
+                }
+            }
+            Log.Write("GENPROBE step8: all 3 generator attempts failed or returned null.");
+        }
+
+        // ---------------------------------------------------------------------
         // Engine UI-thread marshal target. The engine (DXVision) is WinForms: it
         // pumps messages on its own STA thread, and engine-side sequences that
         // mutate scene state must run there (in the real game they live in click
@@ -1975,6 +3018,77 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
+        // Runs a whole sequence on the engine UI thread via Control.Invoke on the
+        // marshal target (FindEngineUiMarshalTarget), with a 15-min watchdog that
+        // aborts the process when the engine loop stops pumping messages
+        // (deadlock protection: Control.Invoke blocks until the pump runs the
+        // delegate). Falls back to the current thread (previous, racy behavior)
+        // when no marshal target exists. stallNote is logged by the watchdog for
+        // operator follow-up. Shared by phase full and phase genprobe.
+        // ---------------------------------------------------------------------
+        private static void RunOnEngineUiThread(string sequenceName, string stallNote, MethodInvoker body)
+        {
+            Control uiMarshal = FindEngineUiMarshalTarget();
+            if (uiMarshal == null)
+            {
+                Log.Write("WARNING: no engine UI-thread marshal target found (MainWindowHandle=" +
+                          uiMarshalMainWindowHandle + ", OpenForms count=" + uiMarshalFormCount +
+                          "; neither OpenForms handle match nor Control.FromHandle yielded a Control). " +
+                          "Running " + sequenceName + " on the CURRENT thread (id=" +
+                          Thread.CurrentThread.ManagedThreadId + ") - previous, racy behavior.");
+                body();
+                return;
+            }
+
+            Log.Write("UI-marshal: invoking " + sequenceName + " on engine UI thread. " +
+                      "MainWindowHandle=" + uiMarshalMainWindowHandle + ", OpenForms count=" +
+                      uiMarshalFormCount + " (names/titles above), caller thread id=" +
+                      Thread.CurrentThread.ManagedThreadId + ", fallback used=" +
+                      (uiMarshalUsedFallback ? "yes (Control.FromHandle)" : "no (OpenForms handle match)") +
+                      ", marshal control=" + uiMarshal.GetType().Name + " '" +
+                      SafeControlName(uiMarshal) + "'.");
+
+            Exception marshalError = null;
+            bool marshalFinished = false;
+            Thread uiWatchdog = new Thread(delegate()
+            {
+                DateTime armedAt = DateTime.UtcNow;
+                while (!marshalFinished)
+                {
+                    Thread.Sleep(1000);
+                    if (marshalFinished) return;
+                    if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
+                    {
+                        Log.Write("UI-thread marshal watchdog fired - engine loop appears not to pump " +
+                                  "messages; aborting process; " + stallNote);
+                        Environment.Exit(2);
+                    }
+                }
+            });
+            uiWatchdog.IsBackground = true;
+            uiWatchdog.Start();
+            try
+            {
+                uiMarshal.Invoke((MethodInvoker)delegate
+                {
+                    try { body(); }
+                    catch (Exception ex) { marshalError = ex; }
+                });
+            }
+            finally
+            {
+                marshalFinished = true;
+            }
+            if (marshalError != null)
+            {
+                Log.Write("UI-thread marshaled " + sequenceName + " FAILED; exception chain:");
+                LogExceptionChain("MARSHAL", marshalError);
+                if (marshalError is Day0GenException) throw marshalError;
+                throw new Day0GenException("UI-thread marshaled sequence failed unexpectedly.", marshalError);
+            }
+        }
+
+        // ---------------------------------------------------------------------
         // Phase: full — construction + generation + save + verify
         // ---------------------------------------------------------------------
         private static int RunFull()
@@ -2026,75 +3140,9 @@ namespace Day0Gen
             // the engine render loop (ZXGameState.Set / CurrentGameSystem assignment
             // interleave with the engine's own scene changes) and the generator dies
             // with a NullReferenceException on thread-affine state.
-            Control uiMarshal = FindEngineUiMarshalTarget();
-            if (uiMarshal != null)
-            {
-                Log.Write("UI-marshal: invoking construct/generate/save on engine UI thread. " +
-                          "MainWindowHandle=" + uiMarshalMainWindowHandle + ", OpenForms count=" +
-                          uiMarshalFormCount + " (names/titles above), caller thread id=" +
-                          Thread.CurrentThread.ManagedThreadId + ", fallback used=" +
-                          (uiMarshalUsedFallback ? "yes (Control.FromHandle)" : "no (OpenForms handle match)") +
-                          ", marshal control=" + uiMarshal.GetType().Name + " '" +
-                          SafeControlName(uiMarshal) + "'.");
-
-                // Deadlock protection: Control.Invoke blocks this thread until the
-                // engine message pump executes the delegate. If that pump is stuck the
-                // run would hang forever; the watchdog aborts the process instead.
-                Exception marshalError = null;
-                bool marshalFinished = false;
-                Thread uiWatchdog = new Thread(delegate()
-                {
-                    DateTime armedAt = DateTime.UtcNow;
-                    while (!marshalFinished)
-                    {
-                        Thread.Sleep(1000);
-                        if (marshalFinished) return;
-                        if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
-                        {
-                            Log.Write("UI-thread marshal watchdog fired - engine loop appears not to pump " +
-                                      "messages; aborting process; if partial files exist, delete '" + target +
-                                      "' / '" + checkPath + "' manually after review.");
-                            Environment.Exit(2);
-                        }
-                    }
-                });
-                uiWatchdog.IsBackground = true;
-                uiWatchdog.Start();
-                try
-                {
-                    uiMarshal.Invoke((MethodInvoker)delegate
-                    {
-                        try
-                        {
-                            RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
-                        }
-                        catch (Exception ex)
-                        {
-                            marshalError = ex;
-                        }
-                    });
-                }
-                finally
-                {
-                    marshalFinished = true;
-                }
-                if (marshalError != null)
-                {
-                    Log.Write("UI-thread marshaled construct/generate/save sequence FAILED; exception chain:");
-                    LogExceptionChain("MARSHAL", marshalError);
-                    if (marshalError is Day0GenException) throw marshalError;
-                    throw new Day0GenException("UI-thread marshaled sequence failed unexpectedly.", marshalError);
-                }
-            }
-            else
-            {
-                Log.Write("WARNING: no engine UI-thread marshal target found (MainWindowHandle=" +
-                          uiMarshalMainWindowHandle + ", OpenForms count=" + uiMarshalFormCount +
-                          "; neither OpenForms handle match nor Control.FromHandle yielded a Control). " +
-                          "Running construct/generate/save on the CURRENT thread (id=" +
-                          Thread.CurrentThread.ManagedThreadId + ") - previous, racy behavior.");
-                RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
-            }
+            RunOnEngineUiThread("construct/generate/save",
+                "if partial files exist, delete '" + target + "' / '" + checkPath + "' manually after review.",
+                delegate { RunConstructGenerateSave(target, checkPath, effectiveSavesDir); });
 
             // ---- after snapshot -------------------------------------------------------
             Log.Write("Snapshot AFTER ...");

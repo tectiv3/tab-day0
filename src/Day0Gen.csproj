@@ -26,8 +26,10 @@
 
   <ItemGroup>
     <!-- In-box on Windows. Used ONLY to marshal the construct/generate/save
-         sequence onto the engine's WinForms UI thread (RunFull). -->
+         sequence onto the engine's WinForms UI thread (RunFull), plus the
+         System.Drawing.Point/Rectangle probes of the genprobe phase. -->
     <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
   </ItemGroup>
 
 </Project>

@@ -124,6 +124,57 @@ non-pumping engine loop (deadlock); extra ZXLog dump before generation brackets 
 ASCII-only log strings (in-box csc codepage hazard). Deployed exe sha256 `b2fce975dd736b4b257730e7...
 ` (`b2fce975dd736b4b257730e72b6923a3a1cfe21823693cddad858e751c16267e`). Live re-test pending.
 
+## P2.5 — phase `genprobe` (commit `80e2303`, live run pending)
+
+Diagnostic phase to localize the generator NRE empirically (DXWorldGrid/DXNoyseLayer/DXRandom
+weighted choice live in the embedded, non-decompilable DXVision). Interactive like `full`:
+RefuseIfGameRunning + zombie init + password probe + WaitForProjectContext + UI-thread marshal
+(marshal logic extracted into `RunOnEngineUiThread`, shared with `full`), then an 8-step probe
+sequence ON the engine UI thread, each step PASS/FAIL + exception chain, never aborting:
+1 theme pick (`new DXRandom(seed)` + `ChooseValueWithWeights`), 2-4 `DXWorldGrid`
+Create/GetSceneSquareArea/ScenePointFromWorldCell, 5 `DXNoyseLayer` op chain (ctor, FillWithNoyse
+(100,.03,.03,200,300,2), Clone, Substract, MultiplyWith, SetContrast(2), TruncateTo01(.5,1),
+GetAreaNearPoint(n/2,n/2,8,8,1), GetTotalValueOnArea via FromCenter rect else SKIP), 6 `ZXMapDrawer(256)`
+LayerTerrain/LayerObjects/ExtraEntities null-check, 7 template chain (FromID -> EntityTemplates
+IDictionary -> ContainsKey(3153977018683405164) -> indexer -> CreateInstance(null) -> Cell=(128,128)),
+8 the generator itself, 3 attempts with fresh params, 5s/10s sleeps between.
+
+- **FCE handler** (step 0): `AppDomain.CurrentDomain.FirstChanceException` registered on the main
+  thread BEFORE engine start; logs NRE/KeyNotFound/IndexOutOfRange whose stack contains the
+generator class name or DXNoyseLayer/DXWorldGrid/ZXMapDrawer, plus STACKLESS exceptions of those
+types (marked) — the observed NRE is stackless in catch, FCE sees it at throw time. Capped 150
+events, fully try/catch-guarded, unregistered after the sequence.
+- **All DXVision signatures discovered at runtime + logged** (the log becomes the signature
+catalog); args adapted via `ConvertArg` (numeric width, enums, Point/PointF, Rectangle/RectangleF).
+  `ChooseValueWithWeights` handled in both believed shapes: `(IEnumerable<T>, Func<T,float>)`
+  (weight fn = relaxed `Delegate.CreateDelegate` of `(object)->float` reading `PW`) and the
+generator's own 1-arg `Dictionary<T,float>` form.
+- **Read-only**: no DirSnapshot, no save writes; only Day0Gen.log (engine still appends ZXLog.txt —
+known deviation). ZXLog tail (25 lines) dumped at the end, then `GENPROBE DONE`.
+- csproj gained a `System.Drawing` reference (Point/Rectangle probes). `GameReflector.SafeGetTypes`
+went private->internal (used by the ChooseValueWithWeights scan).
+- **Run 08:55 results:** steps 2-7 ALL PASS (DXWorldGrid.Create/GetSceneSquareArea/ScenePointFromWorldCell;
+  full DXNoyseLayer op chain incl. GetTotalValueOnArea; ZXMapDrawer layers; template chain incl.
+  CreateInstance(null)+Cell). Generator still NREs 3/3; FCE stack = single generator frame,
+  ~40-70ms in (mostly JIT). Step-1 failure was SPURIOUS: `ChooseValueWithWeights` is an
+  INSTANCE method on `DXVision.DXRandom` (MemberRef), generic, 1 arg
+  `Dictionary<ZXMapTheme,float>` — generator call:
+  `val.ChooseValueWithWeights<ZXMapTheme>(source.ToDictionary(k=>table[k], k=>table[k].PW))`
+  with key list BR,AL,TM,DS,FA,VO — so step 1's static/extension scan can never find it.
+- **Step 1b added** (runs after step 1): exact replication — fresh `DXRandom(seed)`, key list
+  BR,AL,TM,DS,FA,VO via `Enum.Parse`, reflected `Dictionary<ZXMapTheme,float>` (theme objects as
+  keys, `PW` as values), `ChooseValueWithWeights` found on the DXRandom type with
+  Instance|Static|Public|NonPublic flags (dictionary-like single param, `IsDictionaryLikeParameter`),
+  `MakeGenericMethod(MapThemeType)`, invoked ON the DXRandom instance; logs theme + MapThemeType;
+  failure logs full chain then rethrows.
+- **FCE handler upgraded**: every filtered first-chance exception (stackless or not) now also logs
+  `new StackTrace(ex, true)` frame-by-frame (`FCE frame: <type>.<method> IL=0x.. native=0x.. file=..`;
+  GetILOffset -1 prints as 0xFFFFFFFF) plus `TargetSite` (+MetadataToken, DeclaringType), `Source`,
+  `HResult` — all individually guarded (`LogFceDiagnostics`). Decisive diagnostic: at throw time the
+  runtime has the frames even when `ex.StackTrace` is still empty. Build+audit clean; NOT yet deployed.
+- Params for the generator attempts come from CLI opts (defaults = CC seed 550040233 / 256 cells /
+factors 1.0) with Name fixed to "probe".
+
 ## Project memory / tooling
 
 - SSH: `ssh user@target-host` (PowerShell) or `user@target-host` over tailnet when mDNS is down. scp is
