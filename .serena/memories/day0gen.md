@@ -82,9 +82,17 @@ The real DXVision assembly must be loaded (via the resolver) and used.
    (its method is `initialiseBillionsAndStall`) — an empty arg makes the engine settle at the
    harmless error popup and STALL in-process. `SPEC.md`'s "TABSAT passes its own args" is WRONG.
    Fix applied: invoke `Main` with `new string[] { "" }`.
+4. **Steam handoff happens regardless of the args passed to `Main`** — it propagates the *process*
+   command line. Real bypass (verified live): set `SteamAppId=644930` / `SteamGameId=644930` /
+   `SteamClientLaunch=1` before invoking `Main`. With those set the engine initializes in-process
+   (construction was reached for the first time). The tool now sets them itself.
+5. With the handoff bypassed, `new ZXLevelState()` still throws `NullReferenceException` at
+   `#=zOHDY2QTzgRSB()` → `DXProject.Current` is null (the zombie engine's scene/project init never
+   completed; in a headless SSH session the engine thread throws its own NRE). Added a
+   `WaitForProjectContext()` (poll `DXProject.Current` up to 90 s) before construction. Whether the
+   interactive engine ever completes scene init is the next live unknown.
 
-Live re-test of `--phase full` (interactive, via `run-day0-full.bat` in the TAB dir, run by the user)
-still pending at time of writing.
+Live re-test of `--phase full` pending (interactive, via `run-day0-full.bat`, run by the user).
 
 ## Project memory / tooling
 

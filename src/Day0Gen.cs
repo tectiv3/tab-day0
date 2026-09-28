@@ -253,6 +253,10 @@ namespace Day0Gen
                     FileGenericBase;
         public Type GameModeEnum, MapThemeEnum, ChallengeEnum;
 
+        // DXVision.DXProject / .Current: the engine's scene/project context singleton.
+        public Type DxProjectType;
+        public PropertyInfo DxProjectCurrentProp;
+
         // Program
         public MethodInfo MainMethod;
 
@@ -755,6 +759,28 @@ namespace Day0Gen
                 throw new Day0GenException("DXSystem.Load<T>(bool) not found");
             Found("DXSystem.Load<T>(bool)", "signature-scan", DxSystemLoadMethod);
 
+            // --- DXProject (engine scene/project context) --------------------------------
+            // ZXLevelState's ctor reads DXProject.Current; it is populated by the engine's
+            // scene/project init. Absence is not fatal here (the engine may not have reached
+            // that point yet) - WaitForProjectContext polls it before construction.
+            DxProjectType = DxAssembly.GetType("DXVision.DXProject", false);
+            if (DxProjectType != null)
+            {
+                Found("DXProject type", "public-stable-name", DxProjectType);
+                DxProjectCurrentProp = DxProjectType.GetProperty("Current",
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (DxProjectCurrentProp != null)
+                    Found("DXProject.Current (static)", "public-stable-name", DxProjectCurrentProp);
+                else
+                    Log.Write("NOTE: DXVision.DXProject.Current property not found; " +
+                              "WaitForProjectContext cannot verify engine init.");
+            }
+            else
+            {
+                Log.Write("NOTE: DXVision.DXProject type not found; ZXLevelState construction may fail " +
+                          "with NullReferenceException if the engine project context is missing.");
+            }
+
             // --- ZipSerializer ----------------------------------------------------------
             EnsureZipSerializer();
             Found("ZipSerializer type", "public-stable-name", ZipSerializerType);
@@ -999,6 +1025,16 @@ namespace Day0Gen
         private static int RunMain(string[] args)
         {
             Log.Open();
+
+            // WHY: the engine's bootstrap hands off to Steam (Process.Start + Exit) when it
+            // detects a non-Steam launch, which would kill this process before any reflection
+            // happens. Declaring the TAB's Steam app identity makes it initialize in-process.
+            Environment.SetEnvironmentVariable("SteamAppId", "644930");
+            Environment.SetEnvironmentVariable("SteamGameId", "644930");
+            Environment.SetEnvironmentVariable("SteamClientLaunch", "1");
+            Log.Write("Steam env set: SteamAppId=644930, SteamGameId=644930, SteamClientLaunch=1 " +
+                      "(bypass Steam relaunch handoff; engine initializes in-process).");
+
             int pid;
             using (Process selfProc = Process.GetCurrentProcess()) { pid = selfProc.Id; }
             Log.Write("=== Day0Gen starting (pid " + pid + ") ===");
@@ -1357,6 +1393,56 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
+        // Wait for the engine's scene/project context. ZXLevelState's ctor reads
+        // DXProject.Current (CurrentGeneratedLevel ?? DXProject.Current.LevelFromID(...)),
+        // which is only populated once the zombie engine finishes scene/project init.
+        // ---------------------------------------------------------------------
+        private static void WaitForProjectContext()
+        {
+            if (refl.DxProjectType == null || refl.DxProjectCurrentProp == null)
+                throw new Day0GenException("DXProject.Current was not discovered; cannot verify engine " +
+                                           "scene/project init before construction.");
+
+            Log.Write("Waiting for DXProject.Current (engine scene/project context) ...");
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+            int polls = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                object current = null;
+                try
+                {
+                    current = refl.DxProjectCurrentProp.GetValue(null, null);
+                }
+                catch (Exception e)
+                {
+                    Exception root = e;
+                    if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
+                    if (polls == 0)
+                        Log.Write("DXProject.Current getter threw (will keep polling): " +
+                                  root.GetType().Name + ": " + root.Message);
+                }
+                polls++;
+                if (current != null)
+                {
+                    Log.Write("DXProject.Current ready after " + polls + " poll(s): " + current.GetType().FullName);
+                    return;
+                }
+                if (polls % 20 == 0)
+                {
+                    int left = (int)(deadline - DateTime.UtcNow).TotalSeconds;
+                    if (left < 0) left = 0;
+                    Log.Write("DXProject.Current still null (poll " + polls + ", ~" + left + "s left) ...");
+                }
+                Thread.Sleep(500);
+            }
+
+            Log.Write("TIMEOUT: DXProject.Current remained null for ~90s; engine scene/project init did not complete.");
+            DumpZxLogTail(EffectiveSavesDir(), 60);
+            throw new Day0GenException("Engine scene/project init did not complete: DXProject.Current was null " +
+                                       "after ~90s. See ZXLog tail above.");
+        }
+
+        // ---------------------------------------------------------------------
         // Signer validation: signature(file) must equal sibling .zxcheck content
         // ---------------------------------------------------------------------
         private static void ValidateSigner(string zxsavPath)
@@ -1434,6 +1520,8 @@ namespace Day0Gen
             }
 
             if (opts.ValidateSigner != null) ValidateSigner(opts.ValidateSigner);
+
+            WaitForProjectContext();
 
             // ---- construction: mirror CC handler minus challenge lines ------------
             Log.Write("Constructing game state (name='" + opts.Name + "') ...");
