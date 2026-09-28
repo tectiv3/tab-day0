@@ -14,7 +14,6 @@ using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -1057,11 +1056,6 @@ namespace Day0Gen
     // ---------------------------------------------------------------------------
     internal static class Program
     {
-        [DllImport("user32.dll")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-        private const int SW_MINIMIZE = 6;
-
         private static Options opts;
         private static GameReflector refl;
         private static volatile bool engineThreadDead;
@@ -1273,29 +1267,13 @@ namespace Day0Gen
             t.IsBackground = true;
             t.Start();
 
-            // Poll: minimize popup whenever it appears; wait for manager singleton.
+            // Poll for the manager singleton. We no longer minimize any window: with the
+            // normal-launch (empty) args there is no error popup, so the first window is the
+            // real game window, and minimizing it while it creates its D3D device caused
+            // intermittent D3DERR_INVALIDCALL in DXRender_SlimDX.D3DCreateDevice.
             DateTime deadline = DateTime.UtcNow.AddSeconds(60);
-            bool popupMinimized = false;
             while (DateTime.UtcNow < deadline)
             {
-                try
-                {
-                    using (Process self = Process.GetCurrentProcess())
-                    {
-                        IntPtr hwnd = self.MainWindowHandle;
-                        if (hwnd != IntPtr.Zero && !popupMinimized)
-                        {
-                            ShowWindow(hwnd, SW_MINIMIZE);
-                            popupMinimized = true;
-                            Log.Write("Engine popup detected and minimized.");
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    Log.Write("popup poll: " + e.Message);
-                }
-
                 object mgr = null;
                 try
                 {
