@@ -2171,10 +2171,12 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // FirstChanceException diagnostic. The generator NRE is stackless by the
-        // time our catch block sees it; at throw time the CLR may still have frames.
+        // FirstChanceException diagnostic (shared by the genprobe and full
+        // phases). The generator NRE is stackless by the time our catch block
+        // sees it; at throw time the CLR may still have frames.
         // Filter: NullReferenceException / KeyNotFoundException / IndexOutOfRangeException
-        // whose stack mentions the generator class or the DXVision map types; stackless
+        // whose stack mentions the generator class, the game-system class
+        // (zxRcpu6e7NYzT7tGWqPjpOkc=) or the DXVision map types; stackless
         // exceptions of those types are logged too (marked) - the stackless NRE is
         // precisely the failure under investigation. Tiny + fully guarded: this runs
         // on EVERY first-chance exception in the process until unregistered.
@@ -2185,6 +2187,8 @@ namespace Day0Gen
 
         private static void RegisterFirstChanceHandler()
         {
+            // At most one live handler: a second += would log every event twice.
+            if (genProbeFce != null) return;
             genProbeFceLogged = 0;
             genProbeFce = delegate(object sender, FirstChanceExceptionEventArgs e)
             {
@@ -2205,6 +2209,7 @@ namespace Day0Gen
                         return;
                     }
                     if (st.IndexOf("zyl_NPjjlA7DRfVtsRJCX1kN4BxSr", StringComparison.Ordinal) < 0
+                        && st.IndexOf("zxRcpu6e7NYzT7tGWqPjpOkc=", StringComparison.Ordinal) < 0
                         && st.IndexOf("DXNoyseLayer", StringComparison.Ordinal) < 0
                         && st.IndexOf("DXWorldGrid", StringComparison.Ordinal) < 0
                         && st.IndexOf("ZXMapDrawer", StringComparison.Ordinal) < 0)
@@ -2218,7 +2223,7 @@ namespace Day0Gen
             };
             AppDomain.CurrentDomain.FirstChanceException += genProbeFce;
             Log.Write("FCE handler registered (first-chance NRE/KeyNotFound/IndexOutOfRange filter, " +
-                      "generator + DXVision map-type stacks).");
+                      "generator + game-system + DXVision map-type stacks).");
         }
 
         // Second half of the FCE diagnostic (run for EVERY filtered exception,
@@ -3485,71 +3490,87 @@ namespace Day0Gen
 
             WaitForProjectContext();
 
-            // ---- run the construct/generate/save sequence via the standard dispatch
-            // (main thread by default: the engine's own frame/render threads keep
-            // pumping, which SetLevel's InvokeOnStartFrame + WaitOne depends on;
-            // --ui-marshal forces the legacy Control.Invoke path for A/B runs).
-            DispatchSequence("construct/generate/save",
-                "if partial files exist, delete '" + target + "' / '" + checkPath + "' manually after review.",
-                delegate
+            // FCE diagnostics for phase full too (same handler, filter and 150-event
+            // cap as genprobe): registered HERE, right before the sequence, so the
+            // event budget is spent on construct/generate/save rather than on engine
+            // start-up noise.
+            RegisterFirstChanceHandler();
+
+            try
+            {
+                // ---- run the construct/generate/save sequence via the standard dispatch
+                // (main thread by default: the engine's own frame/render threads keep
+                // pumping, which SetLevel's InvokeOnStartFrame + WaitOne depends on;
+                // --ui-marshal forces the legacy Control.Invoke path for A/B runs).
+                DispatchSequence("construct/generate/save",
+                    "if partial files exist, delete '" + target + "' / '" + checkPath + "' manually after review.",
+                    delegate
+                    {
+                        // Root-cause fix: wipe + rebuild + verify the ZXMapTheme static table
+                        // BEFORE construction/generation (any earlier getter call may have
+                        // poisoned it; the generator reads NumDoomVillages from it).
+                        RebuildAndVerifyThemeTable();
+                        RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
+                    });
+
+                // ---- after snapshot -------------------------------------------------------
+                Log.Write("Snapshot AFTER ...");
+                DirSnapshot after = DirSnapshot.Take(effectiveSavesDir);
+                after.Add(RootDirOf(effectiveSavesDir));
+                after.Add(opts.TabDir, IsOwnTabDirArtifact);
+                if (string.Compare(effectiveSavesDir, savesDir, StringComparison.OrdinalIgnoreCase) != 0)
                 {
-                    // Root-cause fix: wipe + rebuild + verify the ZXMapTheme static table
-                    // BEFORE construction/generation (any earlier getter call may have
-                    // poisoned it; the generator reads NumDoomVillages from it).
-                    RebuildAndVerifyThemeTable();
-                    RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
-                });
+                    after.Add(savesDir);
+                    after.Add(rootDir);
+                }
+                List<string> changes = DirSnapshot.Diff(before, after);
+                // H1: allow-list compares FULL absolute paths (case-insensitive) - exactly
+                // the two artifacts plus the engine's ZXLog.txt in the saves root. A file
+                // merely NAMED like our target in any other (sub)directory is unexpected.
+                string zxLogFull = Path.GetFullPath(ZxLogPath(effectiveSavesDir));
+                List<string> unexpected = new List<string>();
+                bool targetSeen = false;
+                bool checkSeen = false;
+                foreach (string c in changes)
+                {
+                    Log.Write("CHANGE: " + c);
+                    // change lines use the "<VERB>: <path>" form; ':' cannot occur in
+                    // Windows file names so the first ": " cleanly separates
+                    string path = c.Substring(c.IndexOf(": ") + 2).Trim();
+                    if (SameFullPath(path, target)) { targetSeen = true; continue; }
+                    if (SameFullPath(path, checkPath)) { checkSeen = true; continue; }
+                    if (SameFullPath(path, zxLogFull)) continue;
+                    unexpected.Add(c);
+                }
+                if (unexpected.Count > 0)
+                {
+                    foreach (string u in unexpected) Log.Write("UNEXPECTED FILE CHANGE: " + u);
+                    throw new Day0GenException("Unexpected file changes detected (see log). Only " + target +
+                                               " / " + checkPath + " (+engine ZXLog.txt " + zxLogFull +
+                                               ") may change.");
+                }
+                // H2: a successful full run MUST show both new artifacts in the diff. An
+                // empty diff (or a missing artifact) means the snapshot verification itself
+                // failed - that is an abort, not a log line.
+                if (changes.Count == 0)
+                    throw new Day0GenException("No file changes detected after the full run - snapshot verification " +
+                                               "failed (fail closed).");
+                if (!targetSeen || !checkSeen)
+                    throw new Day0GenException("Snapshot verification failed: the diff does not contain both new " +
+                                               "artifacts (target seen=" + targetSeen + ", zxcheck seen=" + checkSeen +
+                                               ") - fail closed.");
 
-            // ---- after snapshot -------------------------------------------------------
-            Log.Write("Snapshot AFTER ...");
-            DirSnapshot after = DirSnapshot.Take(effectiveSavesDir);
-            after.Add(RootDirOf(effectiveSavesDir));
-            after.Add(opts.TabDir, IsOwnTabDirArtifact);
-            if (string.Compare(effectiveSavesDir, savesDir, StringComparison.OrdinalIgnoreCase) != 0)
-            {
-                after.Add(savesDir);
-                after.Add(rootDir);
+                Log.Write("PHASE full COMPLETE: " + target);
+                Log.Write("=== Day0Gen OK ===");
+                return 0;
             }
-            List<string> changes = DirSnapshot.Diff(before, after);
-            // H1: allow-list compares FULL absolute paths (case-insensitive) - exactly
-            // the two artifacts plus the engine's ZXLog.txt in the saves root. A file
-            // merely NAMED like our target in any other (sub)directory is unexpected.
-            string zxLogFull = Path.GetFullPath(ZxLogPath(effectiveSavesDir));
-            List<string> unexpected = new List<string>();
-            bool targetSeen = false;
-            bool checkSeen = false;
-            foreach (string c in changes)
+            finally
             {
-                Log.Write("CHANGE: " + c);
-                // change lines use the "<VERB>: <path>" form; ':' cannot occur in
-                // Windows file names so the first ": " cleanly separates
-                string path = c.Substring(c.IndexOf(": ") + 2).Trim();
-                if (SameFullPath(path, target)) { targetSeen = true; continue; }
-                if (SameFullPath(path, checkPath)) { checkSeen = true; continue; }
-                if (SameFullPath(path, zxLogFull)) continue;
-                unexpected.Add(c);
+                // Every exit path (sequence failure, snapshot abort, success) must
+                // drop the handler: it fires on every first-chance exception
+                // process-wide.
+                UnregisterFirstChanceHandler();
             }
-            if (unexpected.Count > 0)
-            {
-                foreach (string u in unexpected) Log.Write("UNEXPECTED FILE CHANGE: " + u);
-                throw new Day0GenException("Unexpected file changes detected (see log). Only " + target +
-                                           " / " + checkPath + " (+engine ZXLog.txt " + zxLogFull +
-                                           ") may change.");
-            }
-            // H2: a successful full run MUST show both new artifacts in the diff. An
-            // empty diff (or a missing artifact) means the snapshot verification itself
-            // failed - that is an abort, not a log line.
-            if (changes.Count == 0)
-                throw new Day0GenException("No file changes detected after the full run - snapshot verification " +
-                                           "failed (fail closed).");
-            if (!targetSeen || !checkSeen)
-                throw new Day0GenException("Snapshot verification failed: the diff does not contain both new " +
-                                           "artifacts (target seen=" + targetSeen + ", zxcheck seen=" + checkSeen +
-                                           ") - fail closed.");
-
-            Log.Write("PHASE full COMPLETE: " + target);
-            Log.Write("=== Day0Gen OK ===");
-            return 0;
         }
 
         // ---------------------------------------------------------------------
