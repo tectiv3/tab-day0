@@ -276,6 +276,15 @@ namespace Day0Gen
         private const string N_TABLE_LOADER_TYPE = "_0023_003Dz3Zxcp6RwVCZHa9xpeg_003D_003D";
         private const string N_TABLE_LOAD = "_0023_003DzUoK3qsRYSJTT";
         private const string N_FOG_SYSTEM_TYPE = "_0023_003DzJme8KFhmikprnkg_2CDeiQE_003D";
+        // The genuine metadata FullName of the fog system type. ILSpy escapes
+        // non-identifier chars with UPPERCASE hex (U+2CDE would render "_2CDE");
+        // the lowercase "_2CDe" run in this name is a literal identifier
+        // sequence, so Unescape is lossy for it and can never hit. Do NOT rely
+        // on Unescape for this name - try this raw literal first (DiscoverAll).
+        private const string N_FOG_SYSTEM_TYPE_RAW = "#=zJme8KFhmikprnkg_2CDeiQE=";
+        // The fog type's immediate base (#=zsW2J3r72Cu83 : DXVision.DXSystem),
+        // used to disambiguate the marker-scan fallback by base chain.
+        private const string N_SYSTEM_BASE_TYPE = "#=zsW2J3r72Cu83";
 
         public Assembly TabAssembly;
         public Assembly DxAssembly;
@@ -803,31 +812,41 @@ namespace Day0Gen
             Found("game system OnLoad() [creates the fog system; enter-game transition]",
                   "exact-name+DeclaredOnly", GameSystemOnLoadMethod);
 
-            // Fog system type (global internal type). Marker-scan fallback: the
-            // escaped name contains a non-ASCII identifier char, so the unescape
-            // round-trip must match the real metadata name exactly - the marker
-            // scan covers any escaping drift.
-            FogSystemType = TabAssembly.GetType(Unescape(N_FOG_SYSTEM_TYPE), false);
+            // Fog system type (global internal type). C1: the escaped name
+            // contains a LITERAL "_2CDe" run (ILSpy only escapes with uppercase
+            // hex), so Unescape turns it into U+2CDE and misses. Try the raw
+            // metadata literal first, then the lossy decode, against BOTH
+            // assemblies, logging every attempt. C2: only if all exact attempts
+            // miss, fall through to a marker scan that actually disambiguates.
+            string[] fogNames = new string[] { N_FOG_SYSTEM_TYPE_RAW, Unescape(N_FOG_SYSTEM_TYPE) };
+            Assembly[] fogAsms = new Assembly[] { TabAssembly, DxAssembly };
+            for (int ni = 0; ni < fogNames.Length && FogSystemType == null; ni++)
+            {
+                for (int ai = 0; ai < fogAsms.Length && FogSystemType == null; ai++)
+                {
+                    if (fogAsms[ai] == null) continue;
+                    Type t = null;
+                    try { t = fogAsms[ai].GetType(fogNames[ni], false); }
+                    catch (Exception e)
+                    {
+                        Log.Write("FOG NAME TRY: " + fogAsms[ai].GetName().Name +
+                                  ".GetType(\"" + fogNames[ni] + "\") threw: " +
+                                  e.GetType().Name + ": " + e.Message);
+                    }
+                    Log.Write("FOG NAME TRY: " + fogAsms[ai].GetName().Name +
+                              ".GetType(\"" + fogNames[ni] + "\") -> " +
+                              (t == null ? "null" : t.FullName));
+                    if (t != null) { FogSystemType = t; break; }
+                }
+            }
             if (FogSystemType != null)
             {
                 Found("fog system type (created by game-system OnLoad)", "exact-name", FogSystemType);
             }
             else
             {
-                List<Type> markerMatches = FindTypesByMarker(TabAssembly, "zJme8KFhmikprnkg", new List<Type>());
-                if (markerMatches.Count == 0)
-                    FindTypesByMarker(DxAssembly, "zJme8KFhmikprnkg", markerMatches);
-                if (markerMatches.Count == 1)
-                {
-                    FogSystemType = markerMatches[0];
-                    Found("fog system type (created by game-system OnLoad)", "name-marker-scan", FogSystemType);
-                }
-                else
-                {
-                    throw new Day0GenException("Fog system type not resolvable: exact name '" +
-                                               N_FOG_SYSTEM_TYPE + "' missed and the marker scan found " +
-                                               markerMatches.Count + " candidate(s) (need exactly 1)");
-                }
+                FogSystemType = ResolveFogSystemByMarker();
+                Found("fog system type (created by game-system OnLoad)", "name-marker-scan", FogSystemType);
             }
 
             DxSystemType = DxAssembly.GetType("DXVision.DXSystem", false);
@@ -1047,9 +1066,11 @@ namespace Day0Gen
 
         // Marker-based type locator (fallback for obfuscated names whose escaped
         // form contains non-ASCII chars): every type whose FullName carries the
-        // marker. Used by the fog-system type fallback in DiscoverAll.
+        // marker. Raw collector - callers apply the top-level / non-generated /
+        // base-chain filters (see ResolveFogSystemByMarker).
         private static List<Type> FindTypesByMarker(Assembly asm, string marker, List<Type> into)
         {
+            if (asm == null) return into;
             foreach (Type t in SafeGetTypes(asm))
             {
                 if (t == null) continue;
@@ -1059,6 +1080,102 @@ namespace Day0Gen
                     into.Add(t);
             }
             return into;
+        }
+
+        // C2: fog-type marker fallback. Scans BOTH assemblies unconditionally
+        // (de-duplicated by object reference), filters to top-level,
+        // non-compiler-generated types, then keeps only the type whose base
+        // chain roots at the game-system base. Aborts with a full candidate dump
+        // when that does not yield exactly one - the old "need exactly 1" abort
+        // left drift undiagnosable, which is how the last deploy died.
+        private Type ResolveFogSystemByMarker()
+        {
+            List<Type> markerMatches = new List<Type>();
+            FindTypesByMarker(TabAssembly, "zJme8KFhmikprnkg", markerMatches);
+            FindTypesByMarker(DxAssembly, "zJme8KFhmikprnkg", markerMatches);
+
+            List<Type> unique = new List<Type>();
+            foreach (Type t in markerMatches)
+            {
+                bool seen = false;
+                foreach (Type u in unique) { if (ReferenceEquals(u, t)) { seen = true; break; } }
+                if (!seen) unique.Add(t);
+            }
+
+            List<Type> filtered = new List<Type>();
+            foreach (Type t in unique)
+            {
+                if (t.IsNested) continue;
+                string fn = SafeFullName(t);
+                if (fn == null) continue;
+                if (fn.IndexOf("<>", StringComparison.Ordinal) >= 0) continue;
+                if (fn.IndexOf("<", StringComparison.Ordinal) >= 0) continue;
+                filtered.Add(t);
+            }
+
+            List<Type> systemDerived = new List<Type>();
+            foreach (Type t in filtered)
+            {
+                if (DerivesFromSystemBase(t)) systemDerived.Add(t);
+            }
+
+            if (systemDerived.Count == 1) return systemDerived[0];
+
+            Log.Write("FOG MARKER SCAN: raw matches=" + markerMatches.Count +
+                      ", unique=" + unique.Count + ", filtered=" + filtered.Count +
+                      ", system-derived=" + systemDerived.Count + ".");
+            foreach (Type t in filtered)
+            {
+                Log.Write("FOG MARKER CANDIDATE: FullName='" + SafeFullName(t) + "', IsNested=" +
+                          SafeIsNested(t) + ", base-chain=" + BaseChainString(t));
+            }
+
+            if (systemDerived.Count == 0)
+                throw new Day0GenException("Fog system type not resolvable: exact names '" +
+                                           N_FOG_SYSTEM_TYPE_RAW + "' / '" + Unescape(N_FOG_SYSTEM_TYPE) +
+                                           "' missed and the marker scan produced no top-level, non-generated, " +
+                                           "system-derived candidate (" + filtered.Count + " candidate(s) after filtering).");
+            throw new Day0GenException("Fog system type not resolvable: exact names missed and the marker scan " +
+                                       "produced " + systemDerived.Count + " system-derived candidate(s) (need exactly 1); " +
+                                       "see the FOG MARKER CANDIDATE dump above.");
+        }
+
+        // Walks the base chain by name so the check does not depend on
+        // DxSystemType, which is discovered after the fog-system resolution.
+        private static bool DerivesFromSystemBase(Type t)
+        {
+            Type bt = t;
+            for (int depth = 0; bt != null && depth < 64; depth++)
+            {
+                string fn = SafeFullName(bt);
+                if (fn == N_SYSTEM_BASE_TYPE || fn == "DXVision.DXSystem") return true;
+                try { bt = bt.BaseType; } catch { bt = null; }
+            }
+            return false;
+        }
+
+        private static string BaseChainString(Type t)
+        {
+            StringBuilder sb = new StringBuilder();
+            Type bt = t;
+            for (int depth = 0; bt != null && depth < 32; depth++)
+            {
+                if (sb.Length > 0) sb.Append(" -> ");
+                string fn = SafeFullName(bt);
+                sb.Append(fn == null ? "<null>" : fn);
+                try { bt = bt.BaseType; } catch { bt = null; }
+            }
+            return sb.Length == 0 ? "(none)" : sb.ToString();
+        }
+
+        private static string SafeFullName(Type t)
+        {
+            try { return t.FullName; } catch { return null; }
+        }
+
+        private static bool SafeIsNested(Type t)
+        {
+            try { return t.IsNested; } catch { return false; }
         }
 
         private void EnsureZipSerializer()
@@ -4112,34 +4229,42 @@ namespace Day0Gen
                 Log.Write("ADOPT: DXLevel.Current already references the generated level (precondition OK).");
             }
 
-            // (b) Game-system OnLoad: the engine's own enter-game transition. The
-            // adoption dereferences DXSystem.Get<fogsys>() (ZXLevelState.cs ~1606)
-            // and that system is created by OnLoad (DXSystem.Load<fogsys>(true)).
-            // We load the game system deferred (DXSystem.Load<gamesystem>(false),
-            // like the real survival click handler); in the real game the ENGINE
-            // triggers OnLoad in its load cycle - our out-of-band instance never got
-            // it, so the 17:53 run's adoption NRE'd 3ms in on the missing fog
-            // system. OnLoad also disposes the menu UI system (the game's own
-            // enter-game transition) - acceptable: this process exits right after
-            // the save.
-            try
+            // (b) Fog system: the adoption dereferences DXSystem.Get<fogsys>()
+            // (ZXLevelState.cs ~1606) and that system is created by the game
+            // system's OnLoad (DXSystem.Load<fogsys>(true)). We load the game
+            // system deferred (DXSystem.Load<gamesystem>(false), like the real
+            // survival click handler), so our out-of-band instance may not have
+            // it. Invoke OnLoad ONLY when the fog system is actually missing:
+            // OnLoad disposes the live survival/CC menu system and other
+            // singletons, so it must only run on demand.
+            MethodInfo fogGet = refl.DxSystemGetMethod.MakeGenericMethod(refl.FogSystemType);
+            object fogSystem = refl.Invoke("DXSystem.Get<fogsys>() (pre-OnLoad)",
+                fogGet, null);
+            if (fogSystem != null)
             {
-                refl.Invoke("gamesystem.OnLoad() [creates the fog system]",
-                            refl.GameSystemOnLoadMethod, sys);
+                Log.Write("ADOPT: fog system already present -> skipped OnLoad.");
             }
-            catch (Day0GenException e)
+            else
             {
-                LogExceptionChain("GAME SYSTEM ONLOAD", e);
-                throw new Day0GenException("Game-system OnLoad failed - the fog system the adoption " +
-                                           "dereferences cannot be created; aborting before any save is written.", e);
-            }
+                Log.Write("ADOPT: fog system missing -> running game-system OnLoad ...");
+                try
+                {
+                    refl.Invoke("gamesystem.OnLoad() [creates the fog system]",
+                                refl.GameSystemOnLoadMethod, sys);
+                }
+                catch (Day0GenException e)
+                {
+                    LogExceptionChain("GAME SYSTEM ONLOAD", e);
+                    throw new Day0GenException("Game-system OnLoad failed - the fog system the adoption " +
+                                               "dereferences cannot be created; aborting before any save is written.", e);
+                }
 
-            // OnLoad verification: DXSystem.Get<fogsys>() must now return the fog
-            // system - null is the exact precondition of the 17:53 adoption NRE
-            // (the adopt would NRE on the LayerFog fetch).
-            object fogSystem = refl.Invoke("DXSystem.Get<fogsys>() (post-OnLoad verify)",
-                refl.DxSystemGetMethod.MakeGenericMethod(refl.FogSystemType), null);
-            Log.Write("ADOPT VERIFY: DXSystem.Get<fogsys>() after OnLoad -> " +
+                // Re-fetch: null here is the exact precondition of the 17:53
+                // adoption NRE (the adopt would NRE on the LayerFog fetch).
+                fogSystem = refl.Invoke("DXSystem.Get<fogsys>() (post-OnLoad verify)",
+                    fogGet, null);
+            }
+            Log.Write("ADOPT VERIFY: DXSystem.Get<fogsys>() -> " +
                       (fogSystem == null ? "null" : fogSystem.GetType().FullName));
             if (fogSystem == null)
                 throw new Day0GenException("DXSystem.Get<fogsys>() is null after game-system OnLoad - " +

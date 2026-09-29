@@ -360,3 +360,33 @@ All blocking + recommended findings from the adversarial review implemented in `
 - **M3 partial**: phase-full before/after snapshots now include the TAB install dir, excluding our
   own artifacts (Day0Gen.exe/.exe.config/.pdb/.log/-watchdog.log, run-day0-*.bat) — any other
   engine write there aborts the run. Steam userdata subtree still NOT covered.
+
+## Code-review fixes (notes/code-review-2.md) — deployed, discovery VERIFIED on target-host
+
+Blocking C1/C2/C3 from the second adversarial review implemented in `src/Day0Gen.cs`.
+Deployed exe sha256 `76453345F14A4C4D565A1EB0E930737E24BD199A616184B7BC11475732D9E1BC`
+(local `make build` == remote; `--phase full` re-test still PENDING):
+
+- **C1 (fog name decode)**: the escaped constant `_0023_003DzJme8KFhmikprnkg_2CDeiQE_003D`
+  carries a LITERAL `_2CDe` run (ILSpy escapes non-identifier chars with UPPERCASE hex only), so
+  `Unescape` produced `#=zJme8KFhmikprnkg<U+2CDE>iQE=` and could never hit. New raw constant
+  `N_FOG_SYSTEM_TYPE_RAW = "#=zJme8KFhmikprnkg_2CDeiQE="`; resolution now tries raw literal first,
+  then `Unescape(...)`, against BOTH `TabAssembly` and `DxAssembly`, logging every attempt
+  (`FOG NAME TRY: ...`). Deployed abort was `src/Day0Gen.cs:810`.
+- **C2 (marker fallback)**: `ResolveFogSystemByMarker()` scans BOTH assemblies unconditionally,
+  de-dups by object reference, filters to `!IsNested` and no `<>`/`<` in `FullName`, then keeps the
+  type whose base chain contains `#=zsW2J3r72Cu83` (`N_SYSTEM_BASE_TYPE`) or `DXVision.DXSystem`
+  (name-matched, so it runs before `DxSystemType` discovery). Exactly one → use; zero or >1 →
+  abort AFTER logging `FOG MARKER SCAN` counts + every `FOG MARKER CANDIDATE`
+  (FullName/IsNested/base-chain). `DxAssembly` scan is no longer short-circuited by Tab hits.
+- **C3 (gate OnLoad)**: `AdoptLevelIntoLevelState` now fetches `DXSystem.Get<fogsys>()` FIRST; runs
+  the game system's `OnLoad` ONLY when it is null (logs `fog system already present -> skipped
+  OnLoad` / `fog system missing -> running game-system OnLoad`), re-fetches, and aborts with the
+  existing message if still null. WHY comment added: OnLoad disposes the live survival/CC menu
+  system + other singletons, so it must run on demand only. Adopt guard and all other logic unchanged.
+
+VERIFIED on target-host (2026-09-29 19:39, `--phase discovery`, exit 0):
+`FOG NAME TRY: TheyAreBillions.GetType("#=zJme8KFhmikprnkg_2CDeiQE=") -> #=zJme8KFhmikprnkg_2CDeiQE=`
+followed by `FOUND [exact-name] fog system type` and `PHASE discovery COMPLETE`. This confirms the
+C1 decode (the `_2CDe` is literal; the type IS in TheyAreBillions/TabAssembly) and that the old
+abort at `src/Day0Gen.cs:810` is gone. C2 fallback did not need to run (exact hit).
