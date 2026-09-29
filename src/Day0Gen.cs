@@ -1135,6 +1135,13 @@ namespace Day0Gen
         // one post-readiness getter invocation.
         private const string N_THEME_TABLE_FIELD = "_0023_003DzFIlawjZp0PUe";
 
+        // Game system's current-level instance field (ILSpy-escaped name; declared at
+        // vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs line 1273). SetLevel assigns
+        // it (line 1812) BEFORE the per-entity scene-object creation whose NRE we
+        // tolerate, so ReferenceEquals(field, generatedLevel) is the decisive check
+        // that the engine adopted the level despite the scene-object failure.
+        private const string N_CURRENT_LEVEL_FIELD = "_0023_003DzS4pP_0024s0UqLYY";
+
         private static int Main(string[] args)
         {
             int code = RunMain(args);
@@ -1294,6 +1301,75 @@ namespace Day0Gen
             {
                 Log.Write("Cannot read ZXLog: " + e.Message);
             }
+        }
+
+        // Byte length of ZXLog.txt at the moment of the call. Unreadable/missing log
+        // yields 0 - the post-SetLevel completion poll then scans the whole file,
+        // which costs reads but keeps the run alive.
+        private static long ZxLogLengthBeforeSetLevel(string savesDir)
+        {
+            try
+            {
+                string path = ZxLogPath(savesDir);
+                if (!File.Exists(path)) return 0;
+                long len = new FileInfo(path).Length;
+                Log.Write("ZXLog length before SetLevel: " + len + " byte(s) (" + path + ")");
+                return len;
+            }
+            catch (Exception e)
+            {
+                Log.Write("WARNING: cannot size ZXLog before SetLevel (" + e.GetType().Name + ": " +
+                          e.Message + "); the completion poll will scan from byte 0.");
+                return 0;
+            }
+        }
+
+        // Reads ONLY the bytes appended to ZXLog.txt beyond `offset` (empty string
+        // when nothing new). The engine keeps the log open while appending, so the
+        // file is opened with ReadWrite sharing; the completion marker is pure ASCII,
+        // so UTF-8 decoding of any ANSI payload still matches it.
+        private static string ReadZxLogPortion(string savesDir, long offset)
+        {
+            string path = ZxLogPath(savesDir);
+            if (offset <= 0)
+            {
+                try { return File.Exists(path) ? File.ReadAllText(path) : ""; }
+                catch { return ""; }
+            }
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    if (fs.Length <= offset) return "";
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    using (StreamReader r = new StreamReader(fs))
+                        return r.ReadToEnd();
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Write("WARNING: ZXLog incremental read failed (" + e.GetType().Name + ": " + e.Message + ").");
+                return "";
+            }
+        }
+
+        // Dumps every ZXLog line appended beyond `offset` (timeout diagnostics for
+        // the SetLevel completion poll; same "  | " line shape as DumpZxLogTail).
+        private static void DumpZxLogPortion(string savesDir, long offset)
+        {
+            string portion = ReadZxLogPortion(savesDir, offset);
+            Log.Write("--- ZXLog new portion since SetLevel (" + ZxLogPath(savesDir) + ") ---");
+            if (portion.Length == 0)
+            {
+                Log.Write("  | <nothing appended beyond byte " + offset + ">");
+            }
+            else
+            {
+                string[] lines = portion.Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                    Log.Write("  | " + lines[i].TrimEnd('\r'));
+            }
+            Log.Write("--- end ZXLog new portion ---");
         }
 
         // ---------------------------------------------------------------------
@@ -3632,7 +3708,42 @@ namespace Day0Gen
             object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
             if (level == null)
                 throw new Day0GenException("Generator returned null level.");
-            refl.Invoke("gamesystem.SetLevel(level)", refl.SetLevelMethod, sys, level);
+
+            // Record the ZXLog byte offset BEFORE SetLevel: its engine-side work
+            // (scene objects, minimap, ChangeScene) logs asynchronously, and the
+            // completion poll below must only look at bytes written after this point.
+            long zxLogOffset = ZxLogLengthBeforeSetLevel(effectiveSavesDir);
+
+            bool setLevelSwallowed = false;
+            try
+            {
+                refl.Invoke("gamesystem.SetLevel(level)", refl.SetLevelMethod, sys, level);
+            }
+            catch (Day0GenException e)
+            {
+                Exception innermost = e;
+                while (innermost.InnerException != null) innermost = innermost.InnerException;
+                if (!(innermost is NullReferenceException))
+                    throw;
+                // SetLevel has already assigned the current-level field and adopted
+                // the level when per-entity scene-object creation NREs out (the NRE
+                // escapes at the DXLevel.cs:438 catch handling). Scene objects are
+                // render-layer only - NOT serialized into saves (rebuilt from
+                // LevelEntities on load) - so this failure is expected to be
+                // recoverable. The two verifications below prove engine-side
+                // completion before any save byte is written; a wrong guess aborts.
+                setLevelSwallowed = true;
+                Log.Write("SetLevel threw (expected: recoverable scene-object failure); verifying engine-side completion...");
+                LogExceptionChain("SETLEVEL swallowed", e);
+            }
+
+            // Post-SetLevel verification - required on BOTH the swallowed and the
+            // clean path; only after both pass may the save proceed.
+            VerifySetLevelEngineCompletion(effectiveSavesDir, zxLogOffset);
+            VerifyCurrentLevelField(sys, level);
+            if (setLevelSwallowed)
+                Log.Write("SETLEVEL VERIFY: PASSED after the swallowed scene-object NRE - " +
+                          "level fully adopted engine-side; proceeding to the save.");
 
             DumpZxLogTail(effectiveSavesDir, 15);
 
@@ -3723,6 +3834,118 @@ namespace Day0Gen
             if (!listed)
                 throw new Day0GenException("Manager save list does not contain an entry named '" + opts.Name + "'.");
             Log.Write("Save-list verification OK.");
+        }
+
+        // ---------------------------------------------------------------------
+        // Post-SetLevel verification. SetLevel's per-entity scene-object creation
+        // can throw a recoverable NullReferenceException (ZX.Components.CTerrainResource
+        // fails ~3x, caught+logged by the engine; one NRE escapes at DXLevel.cs:438)
+        // while the engine still COMPLETES level setup - ZXLog of the 17:26 run shows
+        // GetMiniMapImage End -> "LoadLevel - Minimap OK" -> ChangeScene
+        // pre-Invoke/Invoke -> Fade End after the throw. Both checks below run on the
+        // swallowed-NRE and the clean path alike; either failing aborts before the
+        // save is written.
+        // ---------------------------------------------------------------------
+
+        // Engine-side completion marker: logged by ZXSystem_GameLevel after the
+        // minimap is built, i.e. after level setup finished.
+        private const string SetLevelCompletionMarker = "LoadLevel - Minimap OK";
+
+        // (a) poll the ZXLog portion appended after the pre-invoke offset for the
+        // engine's own LoadLevel-completion marker (up to 90s, 1s interval).
+        private static void VerifySetLevelEngineCompletion(string savesDir, long zxLogOffset)
+        {
+            Log.Write("SETLEVEL VERIFY: polling ZXLog (up to 90s, 1s interval) for '" +
+                      SetLevelCompletionMarker + "' ...");
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+            int polls = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                polls++;
+                string portion = ReadZxLogPortion(savesDir, zxLogOffset);
+                if (portion.IndexOf(SetLevelCompletionMarker, StringComparison.Ordinal) >= 0)
+                {
+                    Log.Write("SETLEVEL VERIFY: '" + SetLevelCompletionMarker + "' present after " +
+                              polls + " poll(s) - engine completed level setup (LoadLevel/minimap).");
+                    return;
+                }
+                if (engineThreadDead)
+                {
+                    Log.Write("SETLEVEL VERIFY: engine thread died with no completion marker after " +
+                              polls + " poll(s).");
+                    DumpZxLogPortion(savesDir, zxLogOffset);
+                    throw new Day0GenException("SetLevel verification failed: the engine thread died before " +
+                                               "logging '" + SetLevelCompletionMarker + "' - level setup did not " +
+                                               "complete. See dumped ZXLog portion above.");
+                }
+                Thread.Sleep(1000);
+            }
+            Log.Write("SETLEVEL VERIFY: TIMEOUT - '" + SetLevelCompletionMarker +
+                      "' not in the post-SetLevel ZXLog after " + polls + " poll(s) (~90s).");
+            DumpZxLogPortion(savesDir, zxLogOffset);
+            throw new Day0GenException("SetLevel verification failed: engine did not log '" +
+                                       SetLevelCompletionMarker + "' within 90s of SetLevel - level setup did " +
+                                       "not complete engine-side. See dumped ZXLog portion above.");
+        }
+
+        // (b) the game system's current-level field must reference the exact
+        // generated level object (identity, not equality).
+        private static void VerifyCurrentLevelField(object sys, object level)
+        {
+            FieldInfo field = FindCurrentLevelField();
+            object current = field.GetValue(sys);
+            Log.Write("SETLEVEL VERIFY: current-level field " + field.Name + " -> " +
+                      (current == null ? "null" : current.GetType().FullName) +
+                      "; ReferenceEquals(generated level) = " + ReferenceEquals(current, level));
+            if (!ReferenceEquals(current, level))
+                throw new Day0GenException("SetLevel verification failed: the game system's current-level " +
+                                           "field does not reference the generated level object - the engine did " +
+                                           "not adopt the level; aborting before any save is written.");
+        }
+
+        // Current-level field locator: exact obfuscated name, then the fallback -
+        // the ONLY instance field of the DXLevel type on the game system type (base
+        // chain included). Zero or several candidates abort; no guess is made.
+        private static FieldInfo FindCurrentLevelField()
+        {
+            string realName = GameReflector.Unescape(N_CURRENT_LEVEL_FIELD);
+            FieldInfo exact = FindFieldUp(refl.GameSystemType, realName);
+            if (exact != null)
+            {
+                Log.Write("FOUND [exact-name] game-system current-level field -> " +
+                          (exact.DeclaringType != null ? exact.DeclaringType.FullName : "?") +
+                          "." + realName + " : " + exact.FieldType.Name);
+                return exact;
+            }
+            Log.Write("SETLEVEL VERIFY: current-level field exact-name lookup missed; falling back to " +
+                      "the unique instance field typed " + refl.DxLevelType.FullName +
+                      " on the game system type ...");
+            List<FieldInfo> candidates = new List<FieldInfo>();
+            for (Type t = refl.GameSystemType; t != null; t = t.BaseType)
+            {
+                FieldInfo[] fields;
+                try
+                {
+                    fields = t.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                         BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { continue; }
+                foreach (FieldInfo f in fields)
+                {
+                    if (f.FieldType == refl.DxLevelType) candidates.Add(f);
+                }
+            }
+            if (candidates.Count == 1)
+            {
+                Log.Write("FOUND [typed-instance-field] game-system current-level field -> " +
+                          (candidates[0].DeclaringType != null ? candidates[0].DeclaringType.FullName : "?") +
+                          "." + candidates[0].Name);
+                return candidates[0];
+            }
+            throw new Day0GenException("Game-system current-level field not resolvable: exact name '" +
+                                       realName + "' missed and " + candidates.Count +
+                                       " instance field(s) of type " + refl.DxLevelType.FullName +
+                                       " found on " + refl.GameSystemType.FullName + " (need exactly 1)");
         }
 
         private static void ManualSave(string target, object gs)

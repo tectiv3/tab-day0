@@ -226,6 +226,35 @@ factors 1.0) with Name fixed to "probe".
    A/B testing. Watchdog kept, same 15-min `Environment.Exit(2)`, now in `RunWithWatchdog` around the
    direct execution, stall note names the SetLevel InvokeOnStartFrame/WaitOne mode. Live re-test pending.
 
+10. **SetLevel scene-object NRE is RECOVERABLE (tolerated in code, build+audit clean, NOT deployed/re-tested):**
+    DIAGNOSED from the 17:26 run ZXLog: SetLevel NREs out of per-entity scene-object creation
+    (the callvirt after log id 1452589205, source vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs
+    line ~1849, `level.CreateSceneObject()`): ZX.Components.CTerrainResource fails ~3x (each
+    caught+logged by the engine) and one NRE escapes at DXLevel.cs:438 catch handling. CRUCIALLY
+    the engine RECOVERS and COMPLETES level setup: ZXLog then shows "ZXSystem_GameLevel -
+    GetMiniMapImage - End", "ZXSystem_GameLevel - LoadLevel - Minimap OK", "ZXGame - ChangeScene -
+    pre-Invoke/Invoke", "ZXGame - Fade - End". Scene objects are render-layer only and NOT
+    serialized into saves (rebuilt from LevelEntities on load), so the save can still be valid.
+    New flow in RunConstructGenerateSave (phase full):
+    - Records the ZXLog.txt byte length BEFORE the SetLevel invoke (ZxLogLengthBeforeSetLevel;
+      unreadable -> 0 = whole-file scan).
+    - SetLevel invoke wrapped: a Day0GenException whose INNERMOST exception is a
+      NullReferenceException -> log full chain + "SetLevel threw (expected: recoverable
+      scene-object failure); verifying engine-side completion..." then CONTINUE to
+      verification. Any other exception type aborts as before.
+    - Post-SetLevel verification, required on BOTH the swallowed and the clean path, before
+      the C1 SaveState wrapper call: (a) VerifySetLevelEngineCompletion - poll up to 90s @1s
+      for "LoadLevel - Minimap OK" in ONLY the ZXLog bytes beyond the recorded offset
+      (ReadZxLogPortion: FileShare.ReadWrite open + seek, ASCII marker so UTF-8 decode is
+      safe); logs which poll; timeout or engine-thread-death -> DumpZxLogPortion + abort.
+      (b) VerifyCurrentLevelField - ReferenceEquals(field, generatedLevel) must be true for the
+      game-system current-level instance field `#=zS4pP$s0UqLYY` (ILSpy-escaped
+      `_0023_003DzS4pP_0024s0UqLYY`, declared line 1273, ASSIGNED line 1812 - BEFORE the
+      scene-object creation, so the check stays meaningful even after the NRE). Locator:
+      exact name via FindFieldUp, fallback the ONLY DXLevel-typed instance field on the game
+      system type (base chain included); 0 or >1 candidates abort, no guessing.
+    - FCE handler stays registered for phase full (it already logs this NRE cleanly).
+
 ## Project memory / tooling
 
 - SSH: `ssh user@target-host` (PowerShell) or `user@target-host` over tailnet when mDNS is down. scp is
