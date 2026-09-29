@@ -269,6 +269,33 @@ factors 1.0) with Name fixed to "probe".
     before the save. Compact summary log lines say which of the three needed re-assertion. Live re-test
     pending.
     - FCE handler stays registered for phase full (it already logs this NRE cleanly).
+12. **PreSave NRE root cause = skipped level adoption (17:39 run):** SaveState's PreSave
+    `ZXLevelState.#=zQXHqcVh9mGZZ()` NRE'd because the SetLevel scene-object NRE (item 10)
+    escaped BEFORE the new-level branch's NEXT statement (~line 1851 of
+    `vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs`):
+    `ZXLevelState.Current.#=zf9PbDap0F6OC(level)` - the level ADOPTION into ZXLevelState.
+    Source (`vendor/decompiled/ZX/ZXLevelState.cs` 1597-1621) is the game's own day-0
+    start-state setup: `IDCurrentMission = level.ID;` then
+    `if (!DXLevel.Current.IsInProject) CurrentGeneratedLevel = DXLevel.Current;` (the very
+    state PreSave dereferences), `LevelEntities = null;` (rebuilt by PreSave), LayerFog/
+    LayerActivity, `DXGame.Current.SetGameTime(0.0)`, `Gold += 100; Wood += 20;` starting
+    resources. Fix in `src/Day0Gen.cs` (build+audit clean, NOT deployed): new step
+    "adopt level into ZXLevelState (SetLevel continuation)" in RunConstructGenerateSave
+    after the SetLevel verification block, BEFORE ReAssertStateBeforeSave
+    (`AdoptLevelIntoLevelState(ls, level)`):
+    - Precondition: static `DXLevel.Current` (adoption dereferences it for the IsInProject
+      gate + CurrentGeneratedLevel source) must ReferenceEquals our level; discovered at
+      use-site as settable static property or writable static field (`FindDxLevelCurrentProp`/
+      `FindDxLevelCurrentField`), abort if neither settable; set with before/after + recheck.
+    - Invoke `_0023_003Dzf9PbDap0F6OC(DXLevel)` (public instance on ZXLevelState,
+      exact-name-discovered in DiscoverAll as `AdoptLevelMethod`) on OUR ls, guarded by
+      SetLevel's own branch condition (IDCurrentMission != level.ID) so a clean path never
+      double-applies the +100/+20; on invoke throw: full chain (`ADOPT LEVEL`) + abort
+      (phase-full FCE captures the IL offset).
+    - Verify: IDCurrentMission == level.ID (ulong compare, both logged);
+      CurrentGeneratedLevel ReferenceEquals level; LevelEntities null; log Gold/Wood
+      (expect +100/+20 on top of ctor defaults - log only, NOT asserted). Abort on any
+      check failure. Live re-test pending.
 
 ## Project memory / tooling
 

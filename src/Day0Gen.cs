@@ -272,6 +272,7 @@ namespace Day0Gen
         private const string N_THEME_TABLE = "_0023_003Dz4k5FO_0024EclQhr";
         private const string N_GAMESYS_TYPE = "_0023_003DzxRcpu6e7NYzT7tGWqPjpOkc_003D";
         private const string N_SET_LEVEL = "_0023_003DzmTU4kueQctVr";
+        private const string N_ADOPT_LEVEL = "_0023_003Dzf9PbDap0F6OC";
         private const string N_TABLE_LOADER_TYPE = "_0023_003Dz3Zxcp6RwVCZHa9xpeg_003D_003D";
         private const string N_TABLE_LOAD = "_0023_003DzUoK3qsRYSJTT";
 
@@ -334,6 +335,9 @@ namespace Day0Gen
         // Game system
         public MethodInfo SetLevelMethod;            // instance (DXLevel) -> void
         public MethodInfo DxSystemLoadMethod;        // static generic (bool) -> T
+
+        // ZXLevelState
+        public MethodInfo AdoptLevelMethod;          // instance (DXLevel) -> void  [level adoption: SetLevel continuation]
 
         // DXVision.Serialization.ZipSerializer
         public PropertyInfo ZipCurrentProp, ZipPasswordProp;
@@ -762,6 +766,18 @@ namespace Day0Gen
                 || SetLevelMethod.GetParameters()[0].ParameterType != DxLevelType)
                 throw new Day0GenException("SetLevel(DXLevel) not found on game system type");
             Found("game system SetLevel(DXLevel)", gsStrategy == "exact-name" ? "exact-name" : "signature-scan", SetLevelMethod);
+
+            // --- Level adoption (SetLevel continuation) -------------------------------
+            // In SetLevel's new-level branch this statement sits right AFTER the
+            // tolerated scene-object failure point and is skipped when that NRE
+            // escapes - phase full invokes it itself (AdoptLevelIntoLevelState).
+            AdoptLevelMethod = LevelStateType.GetMethod(Unescape(N_ADOPT_LEVEL),
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (AdoptLevelMethod == null || AdoptLevelMethod.GetParameters().Length != 1
+                || AdoptLevelMethod.GetParameters()[0].ParameterType != DxLevelType)
+                throw new Day0GenException("Level adoption method " + N_ADOPT_LEVEL +
+                                           "(DXLevel) not found on ZXLevelState");
+            Found("ZXLevelState adopt level (SetLevel continuation)", "exact-name", AdoptLevelMethod);
 
             DxSystemType = DxAssembly.GetType("DXVision.DXSystem", false);
             if (DxSystemType == null) throw new Day0GenException("Type DXVision.DXSystem not found");
@@ -3745,6 +3761,12 @@ namespace Day0Gen
                 Log.Write("SETLEVEL VERIFY: PASSED after the swallowed scene-object NRE - " +
                           "level fully adopted engine-side; proceeding to the save.");
 
+            // ---- adopt level into ZXLevelState (SetLevel continuation) --------------
+            // The 17:39 run proved the scene-object NRE escapes BEFORE SetLevel's
+            // new-level branch reaches the ZXLevelState adoption - the state PreSave
+            // dereferences (CurrentGeneratedLevel) was never built. Complete it here.
+            AdoptLevelIntoLevelState(ls, level);
+
             DumpZxLogTail(effectiveSavesDir, 15);
 
             // During the verification window above the engine's scene machine can
@@ -3951,6 +3973,199 @@ namespace Day0Gen
                                        realName + "' missed and " + candidates.Count +
                                        " instance field(s) of type " + refl.DxLevelType.FullName +
                                        " found on " + refl.GameSystemType.FullName + " (need exactly 1)");
+        }
+
+        // ---------------------------------------------------------------------
+        // Level adoption into ZXLevelState - the skipped SetLevel continuation.
+        // 17:39 run: SetLevel's new-level branch NREs in per-entity scene-object
+        // creation and the NRE ESCAPES at DXLevel.cs:438 - BEFORE the branch's next
+        // statement, ZXLevelState.Current.#=zf9PbDap0F6OC(level) (decompile
+        // --zxRcpu6e7NYzT7tGWqPjpOkc-.cs ~line 1851). That adoption is the game's own
+        // day-0 start-state setup (ZXLevelState.cs 1597-1621): IDCurrentMission,
+        // CurrentGeneratedLevel (what PreSave #=zQXHqcVh9mGZZ dereferences - the NRE
+        // this step fixes), LevelEntities reset, LayerFog/LayerActivity, game time 0,
+        // starting resources Gold += 100 / Wood += 20. Steps: (a) DXLevel.Current must
+        // reference our level (the adoption dereferences it for the IsInProject gate
+        // and the CurrentGeneratedLevel source); (b) invoke the adoption on our ls;
+        // (c) verify the postconditions PreSave depends on.
+        // ---------------------------------------------------------------------
+        private static void AdoptLevelIntoLevelState(object ls, object level)
+        {
+            Log.Write("ADOPT: adopting the generated level into ZXLevelState (SetLevel continuation) ...");
+
+            // (a) DXLevel.Current precondition.
+            PropertyInfo curProp = FindDxLevelCurrentProp();
+            FieldInfo curField = (curProp != null) ? null : FindDxLevelCurrentField();
+            if (curProp == null && curField == null)
+                throw new Day0GenException("DXLevel.Current is neither a static property with a setter " +
+                                           "nor a writable static field - cannot set the adoption precondition; aborting.");
+            object current = curProp != null
+                ? refl.GetProp("DXLevel.Current (adopt precondition)", curProp, null)
+                : curField.GetValue(null);
+            if (current == null || !ReferenceEquals(current, level))
+            {
+                Log.Write("ADOPT: DXLevel.Current -> " +
+                          (current == null ? "null" : current.GetType().FullName) +
+                          " (!= our level); setting it to the generated level ...");
+                if (curProp != null)
+                    refl.SetProp("DXLevel.Current=level (adopt precondition)", curProp, null, level);
+                else
+                    curField.SetValue(null, level);
+                object after = curProp != null
+                    ? refl.GetProp("DXLevel.Current (adopt recheck)", curProp, null)
+                    : curField.GetValue(null);
+                Log.Write("ADOPT: DXLevel.Current after set -> " +
+                          (after == null ? "null" : after.GetType().FullName));
+                if (!ReferenceEquals(after, level))
+                    throw new Day0GenException("Adoption precondition failed: DXLevel.Current still does not " +
+                                               "reference the generated level after the set - aborting before any save is written.");
+            }
+            else
+            {
+                Log.Write("ADOPT: DXLevel.Current already references the generated level (precondition OK).");
+            }
+
+            // (b) Invoke the adoption. The guard mirrors SetLevel's own branch
+            // condition (the statement only runs when IDCurrentMission != level.ID):
+            // on a CLEAN SetLevel path the engine already adopted, and invoking again
+            // would double the day-0 starting resources (Gold += 100 / Wood += 20 a
+            // second time).
+            ulong levelId = ReadDxLevelId(level);
+            PropertyInfo missionProp = refl.LevelStateType.GetProperty("IDCurrentMission");
+            if (missionProp == null)
+                throw new Day0GenException("Adoption failed: ZXLevelState.IDCurrentMission property not found (build drift?)");
+            ulong missionId = Convert.ToUInt64(refl.GetProp(
+                "ls.IDCurrentMission (adopt guard)", missionProp, ls));
+            if (missionId == levelId)
+            {
+                Log.Write("ADOPT: IDCurrentMission (" + missionId.ToString() +
+                          ") already equals level.ID - SetLevel's adoption ran engine-side; skipping the invoke.");
+            }
+            else
+            {
+                try
+                {
+                    refl.Invoke("ZXLevelState adopt(level) (SetLevel continuation)",
+                                refl.AdoptLevelMethod, ls, level);
+                }
+                catch (Day0GenException e)
+                {
+                    // The phase-full FCE handler is registered and captures the IL
+                    // offset when the adoption throws; this chain is the tool-side view.
+                    LogExceptionChain("ADOPT LEVEL", e);
+                    throw new Day0GenException("Level adoption into ZXLevelState failed - PreSave depends on " +
+                                               "the adopted state (CurrentGeneratedLevel); aborting before any save is written.", e);
+                }
+            }
+
+            // (c) Postconditions: the state PreSave dereferences.
+            missionId = Convert.ToUInt64(refl.GetProp(
+                "ls.IDCurrentMission (adopt verify)", missionProp, ls));
+            Log.Write("ADOPT VERIFY: IDCurrentMission=" + missionId.ToString() +
+                      ", level.ID=" + levelId.ToString() + ".");
+            if (missionId != levelId)
+                throw new Day0GenException("Adoption verify failed: IDCurrentMission (" + missionId.ToString() +
+                                           ") != level.ID (" + levelId.ToString() +
+                                           ") - the level was not adopted; aborting before any save is written.");
+
+            PropertyInfo genProp = refl.LevelStateType.GetProperty("CurrentGeneratedLevel");
+            if (genProp == null)
+                throw new Day0GenException("Adoption verify failed: ZXLevelState.CurrentGeneratedLevel property not found (build drift?)");
+            object generated = refl.GetProp("ls.CurrentGeneratedLevel (adopt verify)", genProp, ls);
+            Log.Write("ADOPT VERIFY: CurrentGeneratedLevel ReferenceEquals(level) = " +
+                      ReferenceEquals(generated, level) + ".");
+            if (!ReferenceEquals(generated, level))
+                throw new Day0GenException("Adoption verify failed: CurrentGeneratedLevel does not reference the " +
+                                           "generated level (now: " + (generated == null ? "null" : generated.GetType().FullName) +
+                                           ") - PreSave would NRE; aborting before any save is written.");
+
+            PropertyInfo entitiesProp = refl.LevelStateType.GetProperty("LevelEntities");
+            if (entitiesProp == null)
+                throw new Day0GenException("Adoption verify failed: ZXLevelState.LevelEntities property not found (build drift?)");
+            object entities = refl.GetProp("ls.LevelEntities (adopt verify)", entitiesProp, ls);
+            Log.Write("ADOPT VERIFY: LevelEntities = " +
+                      (entities == null ? "null (reset by adoption, as expected)" : "NON-NULL"));
+            if (entities != null)
+                throw new Day0GenException("Adoption verify failed: LevelEntities is not null - the adoption was " +
+                                           "supposed to reset it; aborting before any save is written.");
+
+            // Log-only (do NOT assert): the adoption is the game's day-0 setup, so the
+            // starting resources (+100 gold / +20 wood) should be visible on top of
+            // the constructor defaults.
+            PropertyInfo goldProp = refl.LevelStateType.GetProperty("Gold");
+            if (goldProp != null)
+                Log.Write("ADOPT INFO: Gold = " + refl.GetProp("ls.Gold (adopt info)", goldProp, ls) +
+                          " (day-0 setup adds +100; log only, not asserted)");
+            else
+                Log.Write("ADOPT INFO: Gold property not found (log only) - skipped");
+            PropertyInfo woodProp = refl.LevelStateType.GetProperty("Wood");
+            if (woodProp != null)
+                Log.Write("ADOPT INFO: Wood = " + refl.GetProp("ls.Wood (adopt info)", woodProp, ls) +
+                          " (day-0 setup adds +20; log only, not asserted)");
+            else
+                Log.Write("ADOPT INFO: Wood property not found (log only) - skipped");
+        }
+
+        // DXLevel.Current locator, property half. The adoption method DEREFERENCES
+        // DXLevel.Current (IsInProject gate, CurrentGeneratedLevel source) and
+        // SetLevel's own re-load branch assigns it directly ('DXLevel.Current =
+        // level'), so a settable static member exists. Returns the settable static
+        // property, or null (logged why).
+        private static PropertyInfo FindDxLevelCurrentProp()
+        {
+            PropertyInfo p = refl.DxLevelType.GetProperty("Current",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p == null)
+            {
+                Log.Write("ADOPT: DXLevel.Current static property not found - trying static field ...");
+                return null;
+            }
+            if (p.GetSetMethod(true) == null)
+            {
+                Log.Write("ADOPT: DXLevel.Current property has no setter - trying static field ...");
+                return null;
+            }
+            Log.Write("FOUND [public-stable-name] DXLevel.Current settable static property -> " +
+                      (p.DeclaringType != null ? p.DeclaringType.FullName : "?") + ".Current : " +
+                      p.PropertyType.Name);
+            return p;
+        }
+
+        // DXLevel.Current locator, field half (used only when the property is not
+        // settable). Initonly (readonly) fields are not settable reflectively.
+        private static FieldInfo FindDxLevelCurrentField()
+        {
+            FieldInfo f = refl.DxLevelType.GetField("Current",
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (f == null)
+            {
+                Log.Write("ADOPT: DXLevel.Current static field not found either.");
+                return null;
+            }
+            if (f.IsInitOnly)
+            {
+                Log.Write("ADOPT: DXLevel.Current static field is initonly (readonly) - not settable.");
+                return null;
+            }
+            Log.Write("FOUND [public-stable-name] DXLevel.Current static field -> " +
+                      (f.DeclaringType != null ? f.DeclaringType.FullName : "?") + ".Current : " +
+                      f.FieldType.Name + " (static, writable)");
+            return f;
+        }
+
+        // DXLevel.ID accessor for the adoption guard/verify. DXLevel lives in the
+        // embedded, non-decompilable DXVision assembly, so property-vs-field is
+        // resolved at runtime on the level's concrete type (public "ID", numeric).
+        private static ulong ReadDxLevelId(object level)
+        {
+            PropertyInfo p = level.GetType().GetProperty("ID");
+            if (p != null)
+                return Convert.ToUInt64(refl.GetProp("level.ID (adopt)", p, level));
+            FieldInfo f = level.GetType().GetField("ID");
+            if (f == null)
+                throw new Day0GenException("Adoption failed: DXLevel exposes neither an ID property nor an ID field - cannot compare IDCurrentMission");
+            Log.Write("ADOPT: level ID exposed as a FIELD (not property) - reading it directly.");
+            return Convert.ToUInt64(f.GetValue(level));
         }
 
         // ---------------------------------------------------------------------
