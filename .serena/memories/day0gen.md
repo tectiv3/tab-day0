@@ -253,6 +253,21 @@ factors 1.0) with Name fixed to "probe".
       scene-object creation, so the check stays meaningful even after the NRE). Locator:
       exact name via FindFieldUp, fallback the ONLY DXLevel-typed instance field on the game
       system type (base chain included); 0 or >1 candidates abort, no guessing.
+11. **SaveState wrapper silently skipped (17:35 run): start-screen teardown clears ZXGameState.Current.**
+    DIAGNOSED: the wrapper invoke hit its `ZXGameState.Current == null -> Thread.Sleep(2000); return;`
+    branch (invoke 06.451, abort 08.454 = exactly 2s; no writer exception in ZXLog). After SetLevel
+    completed (Minimap OK) the engine's scene machine faded back to the START SCREEN
+    ("ZXSystem_StartScreen - ShowScene/ShowSceneSuccess") and the teardown CLEARED
+    ZXGameState.Current (and possibly ZXLevelState.Current / manager.CurrentGameSystem).
+    Fix in `src/Day0Gen.cs` (build+audit clean, NOT deployed): new `ReAssertStateBeforeSave(gs, ls, sys)`
+    in RunConstructGenerateSave, between the SetLevel verification block and the SaveState wrapper
+    invoke (after the DumpZxLogTail): reads ZXGameState.Current / ZXLevelState.Current via the
+    existing cached static getters (`GameStateCurrentMethod` / `LevelStateCurrentMethod`, exact-name
+    `_0023_003Dzuartwoo_003D`) and `manager.CurrentGameSystem` (CurrentGameSystemProp); any null-or-not-
+    ReferenceEquals(ours) value is re-Set via `GameStateSetMethod` / `LevelStateSetMethod` /
+    CurrentGameSystemProp with before/after logging + recheck; a re-assert that does not stick aborts
+    before the save. Compact summary log lines say which of the three needed re-assertion. Live re-test
+    pending.
     - FCE handler stays registered for phase full (it already logs this NRE cleanly).
 
 ## Project memory / tooling

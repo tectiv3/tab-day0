@@ -3747,6 +3747,11 @@ namespace Day0Gen
 
             DumpZxLogTail(effectiveSavesDir, 15);
 
+            // During the verification window above the engine's scene machine can
+            // fade back to the START SCREEN; its teardown clears the very statics
+            // the SaveState wrapper depends on (17:35 run), so re-assert first.
+            ReAssertStateBeforeSave(gs, ls, sys);
+
             // ---- save: the game's own SaveState wrapper (C1) ------------------------
             // The wrapper (=zSV0_oCta8rEv(name, callback, showWindow, preSave)) is what
             // the game itself calls: FixFileName(name), pause the engine,
@@ -3946,6 +3951,75 @@ namespace Day0Gen
                                        realName + "' missed and " + candidates.Count +
                                        " instance field(s) of type " + refl.DxLevelType.FullName +
                                        " found on " + refl.GameSystemType.FullName + " (need exactly 1)");
+        }
+
+        // ---------------------------------------------------------------------
+        // State re-assertion before the save. 17:35 run: after SetLevel completed
+        // (Minimap OK) the engine's scene machine faded back to the START SCREEN
+        // ("ZXSystem_StartScreen - ShowScene/ShowSceneSuccess") and its teardown
+        // CLEARED ZXGameState.Current (and possibly ZXLevelState.Current /
+        // manager.CurrentGameSystem). The SaveState wrapper reacts to a null
+        // ZXGameState.Current with Thread.Sleep(2000) + silent return - no save,
+        // no writer error (wrapper invoke 06.451, abort 08.454 = exactly the 2s
+        // sleep). The tool still holds the constructed objects, so re-assert all
+        // three references; a re-assert that does not stick aborts before the save.
+        // ---------------------------------------------------------------------
+        private static void ReAssertStateBeforeSave(object gs, object ls, object sys)
+        {
+            Log.Write("RE-ASSERT: checking ZXGameState.Current / ZXLevelState.Current / " +
+                      "manager.CurrentGameSystem before the save ...");
+            bool gsReasserted = ReAssertStaticCurrent("ZXGameState",
+                refl.GameStateCurrentMethod, refl.GameStateSetMethod, gs);
+            bool lsReasserted = ReAssertStaticCurrent("ZXLevelState",
+                refl.LevelStateCurrentMethod, refl.LevelStateSetMethod, ls);
+
+            bool sysReasserted;
+            {
+                if (managerInstance == null)
+                    throw new Day0GenException("Re-assert failed: managerInstance is null - cannot check manager.CurrentGameSystem");
+                object current = refl.GetProp("manager.CurrentGameSystem (re-assert check)",
+                    refl.CurrentGameSystemProp, managerInstance);
+                sysReasserted = false;
+                if (!ReferenceEquals(current, sys))
+                {
+                    Log.Write("RE-ASSERT: manager.CurrentGameSystem -> " +
+                              (current == null ? "null" : current.GetType().FullName) +
+                              " (!= our game system); re-asserting ...");
+                    refl.SetProp("manager.CurrentGameSystem=sys (re-assert)",
+                        refl.CurrentGameSystemProp, managerInstance, sys);
+                    sysReasserted = true;
+                    object after = refl.GetProp("manager.CurrentGameSystem (re-assert recheck)",
+                        refl.CurrentGameSystemProp, managerInstance);
+                    if (!ReferenceEquals(after, sys))
+                        throw new Day0GenException("Re-assert failed: manager.CurrentGameSystem still does not " +
+                            "reference our game system (now: " +
+                            (after == null ? "null" : after.GetType().FullName) + ") - aborting before the save.");
+                }
+            }
+
+            Log.Write("RE-ASSERT: summary - ZXGameState.Current " + (gsReasserted ? "RE-ASSERTED" : "ok") +
+                      ", ZXLevelState.Current " + (lsReasserted ? "RE-ASSERTED" : "ok") +
+                      ", manager.CurrentGameSystem " + (sysReasserted ? "RE-ASSERTED" : "ok") + ".");
+        }
+
+        // Re-asserts one static ".Current" slot against the object we constructed.
+        // Returns true when a re-assert was needed and it stuck; aborts when the
+        // getter still does not return our object after the Set.
+        private static bool ReAssertStaticCurrent(string label, MethodInfo currentGetter, MethodInfo setMethod, object ours)
+        {
+            object current = refl.Invoke(label + ".Current (re-assert check)", currentGetter, null);
+            if (ReferenceEquals(current, ours))
+                return false;
+            Log.Write("RE-ASSERT: " + label + ".Current -> " +
+                      (current == null ? "null" : current.GetType().FullName) +
+                      " (!= our " + label + " instance); re-asserting via " + label + ".Set ...");
+            refl.Invoke(label + ".Set(ours) (re-assert)", setMethod, null, ours);
+            object after = refl.Invoke(label + ".Current (re-assert recheck)", currentGetter, null);
+            if (!ReferenceEquals(after, ours))
+                throw new Day0GenException("Re-assert failed: " + label + ".Current still does not reference " +
+                    "our instance (now: " + (after == null ? "null" : after.GetType().FullName) +
+                    ") - aborting before the save.");
+            return true;
         }
 
         private static void ManualSave(string target, object gs)
