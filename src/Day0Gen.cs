@@ -1142,6 +1142,13 @@ namespace Day0Gen
         // genprobe template-chain probe.
         private const ulong GenProbeCommandCenterTemplateId = 3153977018683405164UL;
 
+        // ZXMapTheme's static private theme-table field (ILSpy-escaped name). The theme
+        // getter assigns this field FIRST with constructor-empty theme objects and only
+        // THEN populates their properties, so an early getter call can leave it non-null
+        // but half-built ("poisoned"). RebuildAndVerifyThemeTable nulls it before the
+        // one post-readiness getter invocation.
+        private const string N_THEME_TABLE_FIELD = "_0023_003DzFIlawjZp0PUe";
+
         private static int Main(string[] args)
         {
             int code = RunMain(args);
@@ -1406,103 +1413,223 @@ namespace Day0Gen
             return c == null ? 0 : c.Count;
         }
 
-        // Reads the theme table (cheap) and reports whether it is non-empty. A read
-        // that throws is treated as "not ready" so callers can keep waiting.
-        private static bool TryReadThemeTable(string purpose, ref object table)
+        // ---------------------------------------------------------------------
+        // Theme-table readiness (root-cause fix for the generator NRE).
+        //
+        // The theme getter (#=z4k5FO$EclQhr) populates its static dictionary in two
+        // stages: it FIRST assigns the static field with constructor-empty theme
+        // objects and THEN fills their properties from the table manager
+        // (TableManagerDefinitions.AutoReadPropertiesInCols). Invoking the getter
+        // BEFORE the engine's own "Tables Excel Read" has completed throws
+        // mid-population but leaves the static field non-null - every later call
+        // then returns that poisoned half-built table, themes keep null
+        // NumDoomVillages, and the generator NREs (IL 0x923:
+        // ZXMapTheme::get_NumDoomVillages -> DXRange::get_First on null).
+        //
+        // Therefore this method NEVER invokes the theme getter. It only waits
+        // passively for engine readiness via the DXProject.FromID gate (non-null
+        // only after the engine's OnLoad/table read), keeping the engine-death
+        // watch: the headless `--phase zombie` engine dies at its modal-dialog
+        // popup long before project init, which is expected there and not a theme
+        // concern (that phase never touches themes). Actual theme-table rebuild +
+        // verification happens in RebuildAndVerifyThemeTable() on the engine UI
+        // thread (phases full and genprobe), whose "Theme table OK" log replaces
+        // the one this method used to emit.
+        // ---------------------------------------------------------------------
+        private static void CheckThemeTable()
         {
-            table = null;
+            bool useFromId = refl.DxProjectFromIdMethod != null;
+            if (!useFromId &&
+                (refl.DxProjectType == null ||
+                 (refl.DxProjectCurrentProp == null && refl.DxProjectCurrentField == null)))
+                throw new Day0GenException("Neither DXProject.FromID nor DXProject.Current was discovered; " +
+                                           "cannot verify engine readiness before theme-table use.");
+
+            string signal = useFromId ? "DXProject.FromID(" + ProjectId + ")" : "DXProject.Current";
+            Log.Write("Theme-table readiness: waiting passively for " + signal + " != null " +
+                      "(completes only after the engine's own table read); the theme getter is NOT " +
+                      "invoked here - an early call poisons the static table.");
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+            int polls = 0;
+            while (DateTime.UtcNow < deadline && !engineThreadDead)
+            {
+                object ready = null;
+                try
+                {
+                    if (useFromId)
+                        ready = refl.DxProjectFromIdMethod.Invoke(null, new object[] { ProjectId });
+                    else
+                        ready = ReadDxProjectCurrent();
+                }
+                catch (Exception e)
+                {
+                    Exception root = e;
+                    if (root is TargetInvocationException && root.InnerException != null) root = root.InnerException;
+                    if (polls == 0)
+                        Log.Write(signal + " probe threw (will keep polling): " +
+                                  root.GetType().Name + ": " + root.Message);
+                }
+                polls++;
+                if (ready != null)
+                {
+                    Log.Write("Engine ready (" + signal + " non-null after " + polls + " poll(s)); the " +
+                              "engine's own table load has completed. The theme table will be rebuilt + " +
+                              "verified on the engine UI thread before any use.");
+                    return;
+                }
+                if (polls % 20 == 0)
+                {
+                    int left = (int)(deadline - DateTime.UtcNow).TotalSeconds;
+                    if (left < 0) left = 0;
+                    Log.Write(signal + " still null (poll " + polls + ", engine " +
+                              (engineThreadDead ? "dead" : "alive") + ", ~" + left + "s left) ...");
+                }
+                Thread.Sleep(500);
+            }
+
+            if (engineThreadDead)
+            {
+                Log.Write("Engine thread died before the project context became ready (expected in " +
+                          "headless zombie mode); skipping theme-table readiness. No theme-table " +
+                          "access was attempted, so nothing was poisoned.");
+                return;
+            }
+
+            Log.Write("TIMEOUT: " + signal + " remained null for ~90s; engine init did not complete.");
+            DumpZxLogTail(EffectiveSavesDir(), 60);
+            throw new Day0GenException("Engine readiness (project context) was null after ~90s - cannot " +
+                                       "proceed to the theme-table rebuild. See ZXLog tail above.");
+        }
+
+        // ---------------------------------------------------------------------
+        // Rebuild + verify the ZXMapTheme static table. Runs on the engine UI
+        // thread (phases full and genprobe) AFTER engine readiness, right before
+        // construction / probe step 1. This is the actual root-cause fix: whatever
+        // state the static field is in (null, or poisoned by an earlier premature
+        // getter call), it is wiped and re-created with the engine fully ready, so
+        // the internal AutoReadPropertiesInCols population must succeed. The
+        // per-entry verification below is the guard that proves the fix worked.
+        // ---------------------------------------------------------------------
+        private static void RebuildAndVerifyThemeTable()
+        {
+            Log.Write("THEME REBUILD: starting (engine ready; rebuilding the ZXMapTheme static table " +
+                      "from scratch).");
+
+            // (a) locate the static private dictionary field: exact obfuscated name
+            // first, then the fallback - the static field typed
+            // Dictionary<ZXMapThemeType, ZXMapTheme>.
+            FieldInfo field = refl.MapThemeType.GetField(GameReflector.Unescape(N_THEME_TABLE_FIELD),
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field == null)
+            {
+                Type expected = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeEnum, refl.MapThemeType);
+                foreach (FieldInfo f in refl.MapThemeType.GetFields(
+                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (f.FieldType == expected) { field = f; break; }
+                }
+                if (field != null)
+                    Log.Write("THEME REBUILD: exact-name lookup missed; fallback found static field '" +
+                              field.Name + "' : " + field.FieldType.FullName);
+            }
+            if (field == null)
+                throw new Day0GenException("ZXMapTheme static theme-table field not found (neither exact " +
+                                           "name '" + N_THEME_TABLE_FIELD + "' nor the Dictionary<" +
+                                           refl.MapThemeEnum.Name + "," + refl.MapThemeType.Name +
+                                           "> static-field fallback)");
+
+            // (b) log the current value, then wipe it (null or a poisoned half-built
+            // table - either way the rebuild starts from a clean slate).
+            object before = field.GetValue(null);
+            Log.Write("THEME REBUILD: static field before: " +
+                      (before == null
+                          ? "null"
+                          : "non-null with " + ThemeCount(before) + " entr(ies) (possibly poisoned)") +
+                      " -> setting it to null.");
+            field.SetValue(null, null);
+
+            // (c) invoke the getter ONCE with the engine ready. Any throw here must
+            // abort - proceeding with a half-built table is the original bug.
+            object table;
             try
             {
-                table = refl.Invoke(purpose, refl.ThemeTableMethod, null);
+                table = refl.Invoke("ZXMapTheme theme table (rebuild)", refl.ThemeTableMethod, null);
             }
             catch (Day0GenException e)
             {
-                Log.Write("Theme table read threw: " + e.Message);
-                return false;
+                Log.Write("THEME REBUILD: getter invocation FAILED - aborting (full chain):");
+                LogExceptionChain("THEME REBUILD", e);
+                throw;
             }
-            return ThemeCount(table) > 0;
+            System.Collections.IDictionary dict = table as System.Collections.IDictionary;
+            if (dict == null)
+                throw new Day0GenException("Rebuilt theme table is not a dictionary: " + DescribeValue(table));
+            Log.Write("THEME REBUILD: getter returned " + dict.Count + " entr(ies).");
+
+            // (d) verify EVERY entry - the guard that the fix worked.
+            PropertyInfo mtProp = FindPropertyUp(refl.MapThemeType, "MapThemeType");
+            PropertyInfo nameProp = FindPropertyUp(refl.MapThemeType, "Name");
+            PropertyInfo pwProp = FindPropertyUp(refl.MapThemeType, "PW");
+            PropertyInfo ndvProp = FindPropertyUp(refl.MapThemeType, "NumDoomVillages");
+            PropertyInfo dvsProp = FindPropertyUp(refl.MapThemeType, "DoomVillagesSize");
+            PropertyInfo ntProp = FindPropertyUp(refl.MapThemeType, "NumTreasures");
+            if (ndvProp == null || dvsProp == null)
+                throw new Day0GenException("ZXMapTheme properties NumDoomVillages/DoomVillagesSize not " +
+                                           "found - cannot verify the rebuilt theme table");
+
+            int index = 0;
+            foreach (System.Collections.DictionaryEntry ent in dict)
+            {
+                index++;
+                object theme = ent.Value;
+                if (theme == null)
+                    throw new Day0GenException("Rebuilt theme table entry [" + ent.Key + "] is null");
+                object ndv = SafePropGet(ndvProp, theme);
+                object dvs = SafePropGet(dvsProp, theme);
+                Log.Write("THEME VERIFY [" + index + "/" + dict.Count + "] key=" + ent.Key +
+                          " MapThemeType=" + SafePropText(mtProp, theme) +
+                          " Name=" + SafePropText(nameProp, theme) +
+                          " PW=" + SafePropText(pwProp, theme) +
+                          " NumDoomVillages=" + DescribeRange(ndv) +
+                          " DoomVillagesSize=" + DescribeRange(dvs) +
+                          " NumTreasures=" + DescribeRange(SafePropGet(ntProp, theme)));
+                if (ndv == null)
+                    throw new Day0GenException("Theme " + ent.Key + ": NumDoomVillages is null - theme " +
+                                               "table is still poisoned/half-built after rebuild");
+                if (dvs == null)
+                    throw new Day0GenException("Theme " + ent.Key + ": DoomVillagesSize is null - theme " +
+                                               "table is still poisoned/half-built after rebuild");
+            }
+            if (dict.Count < 4)
+                throw new Day0GenException("Rebuilt theme table has only " + dict.Count +
+                                           " entr(ies); at least 4 required (BR/AL/TM/DS)");
+            Log.Write("Theme table OK (" + dict.Count + " themes, every entry verified).");
         }
 
-        private static void CheckThemeTable()
+        // Null-safe property read for verification logging: a missing property or a
+        // throwing getter reads as null (verification treats null as failure).
+        private static object SafePropGet(PropertyInfo p, object o)
         {
-            // First attempt: the theme table may already be populated.
-            object table = null;
-            if (TryReadThemeTable("ZXMapTheme theme table", ref table))
-            {
-                Log.Write("Theme table OK (" + ThemeCount(table) + " themes).");
-                return;
-            }
+            try { return p == null ? null : p.GetValue(o, null); }
+            catch { return null; }
+        }
 
-            // Passive wait for the engine's OWN table load. The engine's Main is still
-            // running its "Tables Excel Read" inside the manager ctor; invoking the
-            // loader concurrently corrupts the shared static tables (manager ctor
-            // NREs), so TableLoadMethod must NOT be called while the engine thread is
-            // alive. Poll the table (cheap, at most once per second) and stop as soon
-            // as the engine thread dies.
-            Log.Write("Theme table empty; waiting for engine table load (up to 90s) ...");
-            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
-            DateTime lastRead = DateTime.UtcNow;   // the first read just happened
-            DateTime lastProgress = DateTime.UtcNow;
-            bool engineDied = engineThreadDead;
-            while (DateTime.UtcNow < deadline && !engineDied)
-            {
-                Thread.Sleep(500);
-                engineDied = engineThreadDead;
-                if (DateTime.UtcNow - lastRead >= TimeSpan.FromSeconds(1))
-                {
-                    lastRead = DateTime.UtcNow;
-                    if (TryReadThemeTable("ZXMapTheme theme table (poll)", ref table))
-                    {
-                        Log.Write("Theme table OK after engine-init wait (" + ThemeCount(table) + " themes).");
-                        return;
-                    }
-                }
-                if (DateTime.UtcNow - lastProgress >= TimeSpan.FromSeconds(10))
-                {
-                    lastProgress = DateTime.UtcNow;
-                    int left = (int)(deadline - DateTime.UtcNow).TotalSeconds;
-                    if (left < 0) left = 0;
-                    Log.Write("Theme table still empty (engine " + (engineThreadDead ? "dead" : "alive") +
-                              ", ~" + left + "s left) ...");
-                }
-            }
+        private static string SafePropText(PropertyInfo p, object o)
+        {
+            object v = SafePropGet(p, o);
+            return v == null ? "?" : v.ToString();
+        }
 
-            // The wait may have ended with the table populated (engine finished init or
-            // died after loading it) - re-check before any fallback.
-            if (TryReadThemeTable("ZXMapTheme theme table (post-wait)", ref table))
-            {
-                Log.Write("Theme table OK (" + ThemeCount(table) + " themes).");
-                return;
-            }
-
-            // Last resort: only once the engine thread is gone. The headless
-            // `--phase zombie` path always ends with the engine dead, so this preserves
-            // it; invoking the loader while the engine is alive would race its own load.
-            if (engineThreadDead && refl.TableLoadMethod != null)
-            {
-                Log.Write("Engine thread died with theme table empty; invoking engine table loader (last resort) ...");
-                try
-                {
-                    refl.Invoke("engine table loader", refl.TableLoadMethod, null);
-                }
-                catch (Day0GenException e)
-                {
-                    Log.Write("Engine table loader threw: " + e.Message);
-                }
-                Thread.Sleep(3000);
-                if (TryReadThemeTable("ZXMapTheme theme table (loader retry)", ref table))
-                {
-                    Log.Write("Theme table OK after loader fallback (" + ThemeCount(table) + " themes).");
-                    return;
-                }
-            }
-            else
-            {
-                Log.Write("Theme table timeout with engine thread still alive; not invoking loader " +
-                          "(would race engine init).");
-            }
-
-            throw new Day0GenException("Theme table unavailable after loader attempt - map generation requires it.");
+        // A DXRange<int> rendered as "First..Last" via its First/Last properties.
+        private static string DescribeRange(object range)
+        {
+            if (range == null) return "null";
+            PropertyInfo first = FindPropertyUp(range.GetType(), "First");
+            PropertyInfo last = FindPropertyUp(range.GetType(), "Last");
+            object f = SafePropGet(first, range);
+            object l = SafePropGet(last, range);
+            return (f == null ? "?" : f.ToString()) + ".." + (l == null ? "?" : l.ToString());
         }
 
         private static string EffectiveSavesDir()
@@ -1910,7 +2037,7 @@ namespace Day0Gen
             refl.LoadAssemblies();
             refl.DiscoverAll(false);
 
-            ZombieInit();               // includes account + theme table gates
+            ZombieInit();               // includes account gate + passive engine-readiness wait
             ProbePasswordMachinery();
             WaitForProjectContext();
 
@@ -1920,7 +2047,13 @@ namespace Day0Gen
             {
                 RunOnEngineUiThread("genprobe sequence",
                     "no artifacts are written by the genprobe phase; just collect Day0Gen.log.",
-                    delegate { GenProbeSequence(); });
+                    delegate
+                    {
+                        // Root-cause fix: wipe + rebuild + verify the ZXMapTheme static
+                        // table BEFORE step 1 (the theme pick reads that table).
+                        RebuildAndVerifyThemeTable();
+                        GenProbeSequence();
+                    });
             }
             finally
             {
@@ -1936,6 +2069,9 @@ namespace Day0Gen
         {
             Log.Write("GENPROBE: sequence starting on engine UI thread (thread id=" +
                       Thread.CurrentThread.ManagedThreadId + ").");
+            // NOTE: steps 1/1b run AFTER RebuildAndVerifyThemeTable (see the marshal
+            // delegate in RunGenProbe), so the theme table they read is the freshly
+            // rebuilt + verified one, never a poisoned half-built table.
             ProbeStep("step1 theme pick (DXRandom + ChooseValueWithWeights)", delegate { GenProbeStep1Theme(); });
             ProbeStep("step1b exact generator theme pick (instance ChooseValueWithWeights)",
                      delegate { GenProbeStep1bThemeExact(); });
@@ -2492,9 +2628,10 @@ namespace Day0Gen
         //       k => table[k], k => table[k].PW));
         // Metadata shows ChooseValueWithWeights is an INSTANCE method on
         // DXVision.DXRandom (MemberRef DXRandom::ChooseValueWithWeights, generic,
-        // 1 arg Dictionary<T,float>) - step 1's static-extension scan cannot see
-        // it, so this step drives the instance method directly with a reflected
-        // Dictionary<ZXMapTheme,float>.
+        // 1 dictionary arg) - step 1's static-extension scan cannot see it, so this
+        // step drives the instance method directly with a reflected dictionary.
+        // Runs AFTER RebuildAndVerifyThemeTable, so `table` here is the verified
+        // rebuilt one.
         private static void GenProbeStep1bThemeExact()
         {
             Type dxRandomType = FindTypeAnyOrder("DXVision.DXRandom", refl.DxAssembly);
@@ -2523,9 +2660,12 @@ namespace Day0Gen
             Log.Write("GENPROBE step1b: built List<" + refl.MapThemeEnum.Name + "> with " +
                       keyList.Count + " key(s) (BR,AL,TM,DS,FA,VO).");
 
-            // source.ToDictionary(k => table[k], k => table[k].PW) via reflection:
-            // Dictionary<ZXMapTheme,float>, key = the theme OBJECT, value = its PW.
-            Type wdictType = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeType, typeof(float));
+            // source.ToDictionary(k => table[k], k => table[k].PW) via reflection.
+            // ZXMapTheme.PW is `public int PW`, so the generator's ToDictionary
+            // produces Dictionary<ZXMapTheme,int> (NOT float - the earlier float
+            // reading of the MemberRef was wrong and made the closed parameter
+            // reject our dictionary). Key = the theme OBJECT, value = its PW as int.
+            Type wdictType = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeType, typeof(int));
             object wdict = Activator.CreateInstance(wdictType);
             System.Collections.IDictionary wdictIface = (System.Collections.IDictionary)wdict;
             foreach (object k in keyList)
@@ -2533,10 +2673,10 @@ namespace Day0Gen
                 object theme = dict[k];
                 if (theme == null)
                     throw new Day0GenException("theme table[" + k + "] is null");
-                float pw = Convert.ToSingle(pwProp.GetValue(theme, null), CultureInfo.InvariantCulture);
+                int pw = Convert.ToInt32(pwProp.GetValue(theme, null), CultureInfo.InvariantCulture);
                 wdictIface.Add(theme, pw);
                 Log.Write("GENPROBE step1b: dict.Add(table[" + k + "]) key=" + DescribeValue(theme) +
-                          " PW=" + pw.ToString("R", CultureInfo.InvariantCulture));
+                          " PW=" + pw);
             }
             Log.Write("GENPROBE step1b: built " + wdictType.FullName + " with " + wdictIface.Count +
                       " entr(ies).");
@@ -3112,7 +3252,7 @@ namespace Day0Gen
             refl = new GameReflector();
             refl.LoadAssemblies();
             refl.DiscoverAll(false);
-            ZombieInit();               // includes account + theme table gates
+            ZombieInit();               // includes account gate + passive engine-readiness wait
             ProbePasswordMachinery();
 
             // resolve effective saves dir again now that the engine can tell us
@@ -3142,7 +3282,14 @@ namespace Day0Gen
             // with a NullReferenceException on thread-affine state.
             RunOnEngineUiThread("construct/generate/save",
                 "if partial files exist, delete '" + target + "' / '" + checkPath + "' manually after review.",
-                delegate { RunConstructGenerateSave(target, checkPath, effectiveSavesDir); });
+                delegate
+                {
+                    // Root-cause fix: wipe + rebuild + verify the ZXMapTheme static table
+                    // BEFORE construction/generation (any earlier getter call may have
+                    // poisoned it; the generator reads NumDoomVillages from it).
+                    RebuildAndVerifyThemeTable();
+                    RunConstructGenerateSave(target, checkPath, effectiveSavesDir);
+                });
 
             // ---- after snapshot -------------------------------------------------------
             Log.Write("Snapshot AFTER ...");

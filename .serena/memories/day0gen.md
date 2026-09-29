@@ -174,6 +174,36 @@ went private->internal (used by the ChooseValueWithWeights scan).
   runtime has the frames even when `ex.StackTrace` is still empty. Build+audit clean; NOT yet deployed.
 - Params for the generator attempts come from CLI opts (defaults = CC seed 550040233 / 256 cells /
 factors 1.0) with Name fixed to "probe".
+- **GENERATOR NRE ROOT CAUSE FOUND + FIXED (theme-table poisoning):** IL offset 0x923
+  (`ldfld`/`callvirt ZXMapTheme::get_NumDoomVillages` -> `DXRange.get_First` on null) came from OUR OWN
+  early theme-getter call. `ZXMapTheme.#=z4k5FO$EclQhr()` assigns its static
+  `Dictionary<ZXMapThemeType,ZXMapTheme>` field (`_0023_003DzFIlawjZp0PUe`, real name `#=zFIlawjZp0PUe`)
+  FIRST with constructor-empty theme objects, THEN populates their properties via
+  `TableManagerDefinitions.AutoReadPropertiesInCols` (vendor/decompiled/ZX.GameSystems/ZXMapTheme.cs
+  lines ~839-861). `CheckThemeTable` invoked that getter ~0.5s after `ZX.Program.Main` start, BEFORE
+  the engine's "Tables Excel Read" - the population threw mid-load but left the static non-null =>
+  every later getter call returned the poisoned half-built table => NumDoomVillages stayed null =>
+  generator NRE. Fix in `src/Day0Gen.cs` (build+audit clean, NOT yet deployed):
+  - `CheckThemeTable()` no longer invokes the theme getter AT ALL (also dropped the engine-dead
+    table-loader last resort + `TryReadThemeTable`). It passively waits for engine readiness via the
+    `DXProject.FromID(ProjectId)` gate (non-null only after the engine's OnLoad/table read), keeping
+    the engine-death watch: headless `--phase zombie` (engine dies at its modal popup before project
+    init) now skips quietly - nothing in that phase needs themes. "Theme table OK" logging moved to
+    after the rebuild.
+  - New `RebuildAndVerifyThemeTable()` runs ON THE MARSHALED ENGINE UI THREAD in BOTH `full` and
+    `genprobe`, right before construction / probe step 1: (a) reflectively gets the static field
+    `_0023_003DzFIlawjZp0PUe` (fallback: the unique static field of type
+    `Dictionary<ZXMapThemeType,ZXMapTheme>`), logging its current value (null or count); (b) sets it to
+    null; (c) invokes `#=z4k5FO$EclQhr()` once (engine ready now), logging the entry count - a throw
+    logs the full chain and RETHROWS (abort, never proceed); (d) verifies EVERY entry, logging
+    MapThemeType/Name/PW/NumDoomVillages/DoomVillagesSize/NumTreasures (ranges as "First..Last" via
+    First/Last props) and throwing `Day0GenException` on any null theme, null NumDoomVillages or
+    DoomVillagesSize, or fewer than 4 entries - this validation is the guard that the fix worked.
+  - genprobe step1b weights dict fixed float->int: `ZXMapTheme.PW` is `public int PW`, so the
+    generator's `source.ToDictionary(k=>table[k], k=>table[k].PW)` builds
+    `Dictionary<ZXMapTheme,int>` (the earlier "Dictionary<T,float>" MemberRef reading was wrong);
+    step1b now builds the int dict so the closed `ChooseValueWithWeights` parameter accepts it and
+    the exact pick can run.
 
 ## Project memory / tooling
 
