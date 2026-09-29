@@ -205,6 +205,27 @@ factors 1.0) with Name fixed to "probe".
     step1b now builds the int dict so the closed `ChooseValueWithWeights` parameter accepts it and
     the exact pick can run.
 
+9. **SetLevel WaitOne deadlock (dispatch change, build+audit clean, NOT deployed):** the UI-thread marshal
+   from #8 was added for a MISDIAGNOSIS. `SetLevel` (#=zmTU4kueQctVr in
+   vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs line 1685) does
+   `if (flag) { DXGame.Current.InvokeOnStartFrame(action); _0023_003DzZbef....WaitOne(); }` - it queues a
+   start-frame action and BLOCKS until the engine's frame loop executes it. With our construct/generate/save
+   marshaled ONTO the engine WinForms UI thread, the pump was occupied by our delegate; the engine's pending
+   scene change (triggered by ZXGameState.Set, needs the pump) + the WaitOne = MUTUAL DEADLOCK (observed:
+   SetLevel hung at ~3% CPU until the watchdog killed the run). The generator NRE that motivated the marshal
+   was actually the poisoned theme table (see #8's root-cause fix; generator then succeeded: `INVOKE OK
+   generator(params) -> DXLevel` in 215ms), and the engine demonstrably has an INDEPENDENT frame/render
+   thread (ZXLog logs RenderFrame while our thread executes) - so running on OUR OWN thread lets
+   InvokeOnStartFrame actions execute and WaitOne signal, matching TABSAT's arrangement. Fix in
+   `src/Day0Gen.cs`: new `DispatchSequence()` (used by both `full` and `genprobe`) runs the sequence
+   (RebuildAndVerifyThemeTable + RunConstructGenerateSave / GenProbeSequence) DIRECTLY on the main tool
+   thread, logging `dispatch: main thread (engine threads pump freely)`; engine-UI info
+   (MainWindowHandle/OpenForms) still logged as reference only, marked "not used for dispatch". The old
+   `RunOnEngineUiThread`/`FindEngineUiMarshalTarget` machinery is KEPT but only reachable via the new
+   valueless CLI flag `--ui-marshal` (logs `dispatch: UI-marshal (legacy, may deadlock in SetLevel)`) for
+   A/B testing. Watchdog kept, same 15-min `Environment.Exit(2)`, now in `RunWithWatchdog` around the
+   direct execution, stall note names the SetLevel InvokeOnStartFrame/WaitOne mode. Live re-test pending.
+
 ## Project memory / tooling
 
 - SSH: `ssh user@target-host` (PowerShell) or `user@target-host` over tailnet when mDNS is down. scp is

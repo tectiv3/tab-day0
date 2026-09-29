@@ -5,9 +5,12 @@
 // C# 5 compatible, target net48. Must be run from the TAB install directory
 // (operator places the exe there) so Assembly.Load("TheyAreBillions") resolves.
 // Compile-time deps: System plus in-box System.Windows.Forms - the engine is
-// WinForms (DXVision) and its state is thread-affine, so the construct/generate/
-// save sequence must be marshaled onto the engine's UI thread (see
-// FindEngineUiMarshalTarget / RunConstructGenerateSave).
+// WinForms (DXVision). The construct/generate/save sequence runs on this tool's
+// MAIN thread: the engine has independent frame/render threads that keep
+// pumping while we work (SetLevel queues InvokeOnStartFrame actions and waits
+// on them - those only run if we stay OFF the engine's WinForms UI thread;
+// see DispatchSequence). The legacy Control.Invoke marshal onto the engine UI
+// thread is kept behind --ui-marshal for A/B testing (may deadlock in SetLevel).
 //
 // Phases: discovery | zombie | genprobe (generator diagnostic) | full (later
 // phases imply earlier ones; genprobe is a read-only diagnostic, see RunGenProbe).
@@ -85,6 +88,7 @@ namespace Day0Gen
         public float Pop = 1.0f;
         public string Name = "CC 550040233";
         public string ValidateSigner = null;
+        public bool UiMarshal = false;                 // legacy dispatch (A/B only; may deadlock in SetLevel)
 
         public string DefaultSavesDir()
         {
@@ -96,11 +100,19 @@ namespace Day0Gen
         public static Options Parse(string[] args)
         {
             Options o = new Options();
-            // Every flag takes exactly one value; consume args in pairs.
+            // Every flag takes exactly one value (consumed in pairs) except the
+            // valueless --ui-marshal.
             int i = 0;
             while (i < args.Length)
             {
                 string a = args[i];
+                // The only valueless flag: legacy dispatch escape hatch for A/B runs.
+                if (a == "--ui-marshal")
+                {
+                    o.UiMarshal = true;
+                    i += 1;
+                    continue;
+                }
                 bool hasVal = (i + 1) < args.Length;
                 string v = hasVal ? args[i + 1] : null;
                 if (!hasVal)
@@ -1125,7 +1137,7 @@ namespace Day0Gen
         private static volatile bool engineThreadDead;
 
         // Engine UI-thread marshal diagnostics (filled by FindEngineUiMarshalTarget,
-        // logged right before Control.Invoke in RunFull).
+        // logged right before Control.Invoke in the legacy --ui-marshal path).
         private static bool uiMarshalUsedFallback;
         private static IntPtr uiMarshalMainWindowHandle;
         private static int uiMarshalFormCount;
@@ -1226,9 +1238,12 @@ namespace Day0Gen
         private static string Usage()
         {
             return "Day0Gen --phase discovery|zombie|genprobe|full [--tab-dir <dir>] [--saves-dir <dir>] [--seed N]\r\n"
-                 + "        [--ncells N] [--duration F] [--pop F] [--name S] [--validate-signer <zxsav>]\r\n"
-                 + "        (genprobe: interactive generator diagnostic; zombie init + engine-UI-thread\r\n"
-                 + "         probe sequence; writes nothing besides Day0Gen.log)";
+                 + "        [--ncells N] [--duration F] [--pop F] [--name S] [--validate-signer <zxsav>] [--ui-marshal]\r\n"
+                 + "        (--ui-marshal: legacy dispatch onto the engine WinForms UI thread via\r\n"
+                 + "         Control.Invoke - A/B testing only, may deadlock in SetLevel; default runs\r\n"
+                 + "         the sequence on the main tool thread)\r\n"
+                 + "        (genprobe: interactive generator diagnostic; zombie init + probe sequence;\r\n"
+                 + "         writes nothing besides Day0Gen.log)";
         }
 
         // ---------------------------------------------------------------------
@@ -1432,9 +1447,9 @@ namespace Day0Gen
         // watch: the headless `--phase zombie` engine dies at its modal-dialog
         // popup long before project init, which is expected there and not a theme
         // concern (that phase never touches themes). Actual theme-table rebuild +
-        // verification happens in RebuildAndVerifyThemeTable() on the engine UI
-        // thread (phases full and genprobe), whose "Theme table OK" log replaces
-        // the one this method used to emit.
+        // verification happens in RebuildAndVerifyThemeTable() as part of the
+        // dispatched sequence (phases full and genprobe), whose "Theme table OK" log
+        // replaces the one this method used to emit.
         // ---------------------------------------------------------------------
         private static void CheckThemeTable()
         {
@@ -1475,7 +1490,7 @@ namespace Day0Gen
                 {
                     Log.Write("Engine ready (" + signal + " non-null after " + polls + " poll(s)); the " +
                               "engine's own table load has completed. The theme table will be rebuilt + " +
-                              "verified on the engine UI thread before any use.");
+                              "verified before any use.");
                     return;
                 }
                 if (polls % 20 == 0)
@@ -1503,8 +1518,8 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // Rebuild + verify the ZXMapTheme static table. Runs on the engine UI
-        // thread (phases full and genprobe) AFTER engine readiness, right before
+        // Rebuild + verify the ZXMapTheme static table. Runs inside the dispatched
+        // sequence (phases full and genprobe) AFTER engine readiness, right before
         // construction / probe step 1. This is the actual root-cause fix: whatever
         // state the static field is in (null, or poisoned by an earlier premature
         // getter call), it is wiped and re-created with the engine fully ready, so
@@ -2015,7 +2030,7 @@ namespace Day0Gen
         // heavy lifting (DXWorldGrid / DXNoyseLayer / ZXMapDrawer / DXRandom weighted
         // choice) lives in the embedded DXVision assembly, which cannot be
         // decompiled locally - so the failure is localized empirically: a fixed probe
-        // sequence runs on the engine UI thread exactly like phase full, each step
+        // sequence runs through the same dispatch as phase full, each step
         // logging PASS/FAIL with its exception chain, and a FirstChanceException
         // handler (registered before engine start) catches the NRE at throw time,
         // when the CLR may still have a stack for it.
@@ -2041,11 +2056,11 @@ namespace Day0Gen
             ProbePasswordMachinery();
             WaitForProjectContext();
 
-            Log.Write("GENPROBE: starting probe sequence on the engine UI thread; this phase writes " +
+            Log.Write("GENPROBE: starting probe sequence; this phase writes " +
                       "nothing besides Day0Gen.log (no snapshots, no save artifacts).");
             try
             {
-                RunOnEngineUiThread("genprobe sequence",
+                DispatchSequence("genprobe sequence",
                     "no artifacts are written by the genprobe phase; just collect Day0Gen.log.",
                     delegate
                     {
@@ -2067,9 +2082,9 @@ namespace Day0Gen
 
         private static void GenProbeSequence()
         {
-            Log.Write("GENPROBE: sequence starting on engine UI thread (thread id=" +
+            Log.Write("GENPROBE: sequence starting (thread id=" +
                       Thread.CurrentThread.ManagedThreadId + ").");
-            // NOTE: steps 1/1b run AFTER RebuildAndVerifyThemeTable (see the marshal
+            // NOTE: steps 1/1b run AFTER RebuildAndVerifyThemeTable (see the dispatch
             // delegate in RunGenProbe), so the theme table they read is the freshly
             // rebuilt + verified one, never a poisoned half-built table.
             ProbeStep("step1 theme pick (DXRandom + ChooseValueWithWeights)", delegate { GenProbeStep1Theme(); });
@@ -3052,14 +3067,16 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // Engine UI-thread marshal target. The engine (DXVision) is WinForms: it
-        // pumps messages on its own STA thread, and engine-side sequences that
-        // mutate scene state must run there (in the real game they live in click
-        // handlers on the message-loop thread). Preference: the Application.OpenForms
-        // form whose handle equals the process MainWindowHandle; fallback
-        // Control.FromHandle(MainWindowHandle). Returns null when neither yields a
-        // Control - the caller then runs inline on its own thread (previous
-        // behavior). Fills the uiMarshal* diagnostics fields for the pre-Invoke log.
+        // Engine UI-thread marshal target (legacy --ui-marshal path only). The
+        // engine (DXVision) is WinForms: it pumps messages on its own STA thread;
+        // this marshal runs our sequence on that thread (in the real game such
+        // sequences live in click handlers there) - the dispatch now known to
+        // deadlock in SetLevel, hence kept only for A/B testing. Preference: the
+        // Application.OpenForms form whose handle equals the process
+        // MainWindowHandle; fallback Control.FromHandle(MainWindowHandle).
+        // Returns null when neither yields a Control - the caller then runs
+        // inline on its own thread. Fills the uiMarshal* diagnostics fields for
+        // the pre-Invoke log.
         // ---------------------------------------------------------------------
         private static Control FindEngineUiMarshalTarget()
         {
@@ -3158,13 +3175,18 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // Runs a whole sequence on the engine UI thread via Control.Invoke on the
-        // marshal target (FindEngineUiMarshalTarget), with a 15-min watchdog that
-        // aborts the process when the engine loop stops pumping messages
-        // (deadlock protection: Control.Invoke blocks until the pump runs the
-        // delegate). Falls back to the current thread (previous, racy behavior)
-        // when no marshal target exists. stallNote is logged by the watchdog for
-        // operator follow-up. Shared by phase full and phase genprobe.
+        // LEGACY engine UI-thread dispatch (--ui-marshal only). Runs a whole
+        // sequence on the engine UI thread via Control.Invoke on the marshal
+        // target (FindEngineUiMarshalTarget), with a 15-min watchdog that aborts
+        // the process when the engine loop stops pumping messages. KNOWN FAILURE
+        // MODE: SetLevel (#=zmTU4kueQctVr, vendor/decompiled/
+        // --zxRcpu6e7NYzT7tGWqPjpOkc-.cs line 1685) queues InvokeOnStartFrame and
+        // blocks in WaitOne until the engine frame loop runs it - with our
+        // delegate occupying the WinForms UI thread, the engine's pending scene
+        // change (ZXGameState.Set) and that WaitOne deadlock each other
+        // (observed: SetLevel hung at ~3% CPU until the watchdog killed it).
+        // Falls back to the current thread when no marshal target exists.
+        // stallNote is logged by the watchdog for operator follow-up.
         // ---------------------------------------------------------------------
         private static void RunOnEngineUiThread(string sequenceName, string stallNote, MethodInvoker body)
         {
@@ -3199,8 +3221,9 @@ namespace Day0Gen
                     if (marshalFinished) return;
                     if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
                     {
-                        Log.Write("UI-thread marshal watchdog fired - engine loop appears not to pump " +
-                                  "messages; aborting process; " + stallNote);
+                        Log.Write("UI-thread marshal watchdog fired - engine loop not pumping " +
+                                  "(legacy dispatch; known SetLevel WaitOne deadlock mode); " +
+                                  "aborting process; " + stallNote);
                         Environment.Exit(2);
                     }
                 }
@@ -3225,6 +3248,91 @@ namespace Day0Gen
                 LogExceptionChain("MARSHAL", marshalError);
                 if (marshalError is Day0GenException) throw marshalError;
                 throw new Day0GenException("UI-thread marshaled sequence failed unexpectedly.", marshalError);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Dispatch entry for the construct/generate/save (full) and probe
+        // (genprobe) sequences. Default: run body DIRECTLY on the current main
+        // tool thread - the engine has independent frame/render threads (ZXLog
+        // logs RenderFrame while our thread executes), so SetLevel's queued
+        // InvokeOnStartFrame actions execute and its WaitOne signals. This is
+        // TABSAT's arrangement: the engine animates on its threads while the
+        // reflector works on its own. --ui-marshal forces the legacy
+        // Control.Invoke path for A/B testing (may deadlock in SetLevel, see
+        // RunOnEngineUiThread).
+        // ---------------------------------------------------------------------
+        private static void DispatchSequence(string sequenceName, string stallNote, MethodInvoker body)
+        {
+            if (opts.UiMarshal)
+            {
+                Log.Write("dispatch: UI-marshal (legacy, may deadlock in SetLevel).");
+                RunOnEngineUiThread(sequenceName, stallNote, body);
+                return;
+            }
+            Log.Write("dispatch: main thread (engine threads pump freely).");
+            LogEngineUiThreadDiagnostics();
+            RunWithWatchdog(sequenceName, stallNote, body);
+        }
+
+        // 15-min watchdog around a sequence executed on the current (main tool)
+        // thread: the sequence can block indefinitely if the engine frame loop
+        // stops running queued start-frame actions (SetLevel's WaitOne never
+        // signals); Environment.Exit(2) keeps the process from hanging forever.
+        // stallNote tells the operator what to review afterwards.
+        private static void RunWithWatchdog(string sequenceName, string stallNote, MethodInvoker body)
+        {
+            bool finished = false;
+            Thread watchdog = new Thread(delegate()
+            {
+                DateTime armedAt = DateTime.UtcNow;
+                while (!finished)
+                {
+                    Thread.Sleep(1000);
+                    if (finished) return;
+                    if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
+                    {
+                        Log.Write("main-thread watchdog fired - " + sequenceName + " stalled for 15 min " +
+                                  "(likely SetLevel InvokeOnStartFrame/WaitOne never signaled: engine frame " +
+                                  "loop not running); aborting process; " + stallNote);
+                        Environment.Exit(2);
+                    }
+                }
+            });
+            watchdog.IsBackground = true;
+            watchdog.Start();
+            try { body(); }
+            finally { finished = true; }
+        }
+
+        // Reference-only snapshot of the engine WinForms topology, logged before
+        // direct (main-thread) execution. Not used for the dispatch decision -
+        // kept so log runs can be correlated with the form/handle layout the
+        // legacy marshal targeted.
+        private static void LogEngineUiThreadDiagnostics()
+        {
+            try
+            {
+                using (Process self = Process.GetCurrentProcess())
+                {
+                    self.Refresh();
+                    Log.Write("engine-UI info (not used for dispatch): MainWindowHandle=" +
+                              self.MainWindowHandle + ".");
+                }
+                List<Form> formList = new List<Form>();
+                foreach (Form f in Application.OpenForms) formList.Add(f);
+                Log.Write("engine-UI info (not used for dispatch): OpenForms count=" +
+                          formList.Count + ".");
+                for (int i = 0; i < formList.Count; i++)
+                {
+                    Log.Write("engine-UI info (not used for dispatch): form[" + i + "] Name='" +
+                              SafeControlName(formList[i]) + "' Text='" + SafeControlText(formList[i]) + "'.");
+                }
+            }
+            catch (Exception e)
+            {
+                Log.Write("engine-UI info (not used for dispatch): snapshot threw: " +
+                          e.GetType().Name + ": " + e.Message);
             }
         }
 
@@ -3273,14 +3381,11 @@ namespace Day0Gen
 
             WaitForProjectContext();
 
-            // ---- marshal the construct/generate/save sequence onto the engine UI thread.
-            // The zombie engine fully initializes to its main menu - a live WinForms
-            // message pump on the engine thread. In the real game this whole sequence
-            // runs inside a click handler on that thread; run from this thread it races
-            // the engine render loop (ZXGameState.Set / CurrentGameSystem assignment
-            // interleave with the engine's own scene changes) and the generator dies
-            // with a NullReferenceException on thread-affine state.
-            RunOnEngineUiThread("construct/generate/save",
+            // ---- run the construct/generate/save sequence via the standard dispatch
+            // (main thread by default: the engine's own frame/render threads keep
+            // pumping, which SetLevel's InvokeOnStartFrame + WaitOne depends on;
+            // --ui-marshal forces the legacy Control.Invoke path for A/B runs).
+            DispatchSequence("construct/generate/save",
                 "if partial files exist, delete '" + target + "' / '" + checkPath + "' manually after review.",
                 delegate
                 {
@@ -3328,12 +3433,11 @@ namespace Day0Gen
         }
 
         // ---------------------------------------------------------------------
-        // Construction + generation + save + verification, extracted from RunFull so
-        // the whole sequence can be marshaled onto the engine UI thread via
-        // Control.Invoke (or, when no marshal target was found, run inline on the
-        // current thread - the previous behavior). Reads the static opts / refl /
-        // managerInstance fields; the before/after snapshot context lives in RunFull
-        // and is not needed here.
+        // Construction + generation + save + verification, extracted from RunFull
+        // so the whole sequence can be dispatched (main thread by default, legacy
+        // engine-UI marshal under --ui-marshal; see DispatchSequence). Reads the
+        // static opts / refl / managerInstance fields; the before/after snapshot
+        // context lives in RunFull and is not needed here.
         // ---------------------------------------------------------------------
         private static void RunConstructGenerateSave(string target, string checkPath, string effectiveSavesDir)
         {
