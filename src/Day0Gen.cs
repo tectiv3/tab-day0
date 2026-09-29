@@ -31,8 +31,10 @@ using System.Windows.Forms;
 namespace Day0Gen
 {
     // ---------------------------------------------------------------------------
-    // Logging: console + Day0Gen.log (current working directory; the only file,
-    // besides the two save artifacts, this tool is ever allowed to write).
+    // Logging: console + Day0Gen.log (current working directory). The only other
+    // files this tool may ever write: the two save artifacts (phase full) and
+    // Day0Gen-watchdog.log (watchdog abort path only - it must not share Log's
+    // lock, see WatchdogAbort).
     // ---------------------------------------------------------------------------
     internal static class Log
     {
@@ -171,22 +173,31 @@ namespace Day0Gen
         public static DirSnapshot Take(string dir)
         {
             DirSnapshot s = new DirSnapshot();
-            TakeInto(s, dir);
+            TakeInto(s, dir, null);
             return s;
         }
 
-        private static void TakeInto(DirSnapshot s, string dir)
+        // exclude (optional): per-file skip filter (M3: our own artifacts in the TAB
+        // dir). A throwing filter includes the file - fail closed.
+        private static void TakeInto(DirSnapshot s, string dir, Predicate<string> exclude)
         {
             if (!Directory.Exists(dir)) return;
             string[] files;
             try { files = Directory.GetFiles(dir, "*", SearchOption.AllDirectories); }
             catch (Exception e)
             {
-                Log.Write("SNAPSHOT: cannot enumerate " + dir + ": " + e.Message);
-                return;
+                // H2: fail closed - a partial snapshot silently disables write
+                // verification exactly when it is needed most.
+                throw new Day0GenException("Snapshot enumeration failed for " + dir + ": " + e.Message, e);
             }
             foreach (string f in files)
             {
+                if (exclude != null)
+                {
+                    bool skip = false;
+                    try { skip = exclude(f); } catch { }
+                    if (skip) continue;
+                }
                 string key = f;
                 string hash;
                 try
@@ -208,7 +219,9 @@ namespace Day0Gen
             }
         }
 
-        public void Add(string dir) { TakeInto(this, dir); }
+        public void Add(string dir) { TakeInto(this, dir, null); }
+
+        public void Add(string dir, Predicate<string> exclude) { TakeInto(this, dir, exclude); }
 
         // Returns list of human-readable change lines.
         public static List<string> Diff(DirSnapshot before, DirSnapshot after)
@@ -249,6 +262,7 @@ namespace Day0Gen
         private const string N_PWD_SET = "_0023_003DzpKDARrtdO1GK7shdnQ_003D_003D";
         private const string N_PWD_CLEAR = "_0023_003DzvgSfu3ouG_TLllPQAA_003D_003D";
         private const string N_SAVEWRITER = "_0023_003DzMtGuEM2lBSlZ5BGWvg_003D_003D";
+        private const string N_SAVE_WRAPPER = "_0023_003DzSV0_oCta8rEv";
         private const string N_SAVES_FOLDER = "_0023_003DzND5ul2zfzAnWdSnC0A_003D_003D";
         private const string N_SAVE_LIST = "_0023_003DzegKkTm3kHc6FhM_EOg_003D_003D";
         private const string N_STATE_INFO = "_0023_003DzHhDw0V62_0024fqG";
@@ -296,7 +310,8 @@ namespace Day0Gen
         public MethodInfo FlagMethod;                // static (string) -> int
         public MethodInfo PwdSetMethod;              // static (string,int,bool) -> void
         public MethodInfo PwdClearMethod;            // static (string,int,bool) -> void
-        public MethodInfo SaveWriterMethod;          // instance (string) -> void  [game-native full save]
+        public MethodInfo SaveWriterMethod;          // instance (string) -> void  [low-level native writer, no pause/PreSave]
+        public MethodInfo SaveStateWrapperMethod;    // instance (string, Action, bool, bool) -> void  [game SaveState: pause + PreSave + native writer]
         public MethodInfo SavesFolderMethod;         // static () -> string
         public MethodInfo SaveListMethod;            // instance () -> List<ZXGameStateInfo>
 
@@ -524,21 +539,12 @@ namespace Day0Gen
 
             FlagMethod = ManagerType.GetMethod(Unescape(N_FLAG),
                 BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
-            if (FlagMethod != null) Found("password flag (string)->int", "exact-name", FlagMethod);
             if (FlagMethod == null)
-            {
-                FlagMethod = ScanMethod(ManagerType, "flag",
-                    delegate(MethodInfo m)
-                    {
-                        if (!m.IsStatic || m.IsPublic) return false;
-                        ParameterInfo[] p = m.GetParameters();
-                        return p.Length == 1 && p[0].ParameterType == typeof(string)
-                               && m.ReturnType == typeof(int);
-                    });
-                if (FlagMethod == null)
-                    throw new Day0GenException("Password flag method not found");
-                Found("password flag (string)->int", "signature-scan", FlagMethod);
-            }
+                // H4: no signature-scan fallback - an unverified engine method must
+                // never be picked for the password machinery. Exact name or abort.
+                throw new Day0GenException("Password flag method not found by exact name '" + N_FLAG +
+                                           "' (build drift?) - aborting (no signature-scan fallback)");
+            Found("password flag (string)->int", "exact-name", FlagMethod);
 
             PwdSetMethod = ManagerType.GetMethod(Unescape(N_PWD_SET),
                 BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
@@ -546,65 +552,45 @@ namespace Day0Gen
             PwdClearMethod = ManagerType.GetMethod(Unescape(N_PWD_CLEAR),
                 BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
             if (PwdClearMethod != null) Found("password clearer (string,int,bool)->void", "exact-name", PwdClearMethod);
-            if (PwdSetMethod == null || PwdClearMethod == null)
-            {
-                // TABSAT-style fallback: probe all (string,int,bool)->void statics;
-                // the setter is the one that yields a non-empty ZipSerializer password.
-                Log.Write("Password set/clear exact names incomplete; falling back to TABSAT probe scan ...");
-                EnsureZipSerializer();
-                List<MethodInfo> candidates = new List<MethodInfo>();
-                foreach (MethodInfo m in ManagerType.GetMethods(BindingFlags.Static | BindingFlags.NonPublic))
-                {
-                    ParameterInfo[] p = m.GetParameters();
-                    if (p.Length == 3 && p[0].ParameterType == typeof(string) && p[1].ParameterType == typeof(int)
-                        && p[2].ParameterType == typeof(bool) && m.ReturnType == typeof(void))
-                        candidates.Add(m);
-                }
-                // also scan types having ProcessSpecialKeys_KeyUp like TABSAT did
-                foreach (Type t in SafeGetTypes(TabAssembly))
-                {
-                    if (t == null || t == ManagerType) continue;
-                    MethodInfo k = null;
-                    try { k = t.GetMethod("ProcessSpecialKeys_KeyUp", BindingFlags.Instance | BindingFlags.NonPublic); } catch { }
-                    if (k == null) continue;
-                    foreach (MethodInfo m in t.GetMethods(BindingFlags.Static | BindingFlags.NonPublic))
-                    {
-                        ParameterInfo[] p = m.GetParameters();
-                        if (p.Length == 3 && p[0].ParameterType == typeof(string) && p[1].ParameterType == typeof(int)
-                            && p[2].ParameterType == typeof(bool) && m.ReturnType == typeof(void))
-                            candidates.Add(m);
-                    }
-                }
-                foreach (MethodInfo cand in candidates)
-                {
-                    if (PwdSetMethod != null && PwdClearMethod != null) break;
-                    if (PwdSetMethod == null && ProbePasswordCandidate(cand))
-                    {
-                        PwdSetMethod = cand;
-                        Found("password setter (string,int,bool)->void", "signature-scan+probe", cand);
-                    }
-                }
-                if (PwdSetMethod == null)
-                    throw new Day0GenException("Password setter not found by exact name or probe scan");
-                if (PwdClearMethod == null)
-                {
-                    foreach (MethodInfo cand in candidates)
-                    {
-                        if (cand != PwdSetMethod)
-                        {
-                            PwdClearMethod = cand;
-                            Found("password clearer (string,int,bool)->void", "signature-scan(remaining)", cand);
-                            break;
-                        }
-                    }
-                }
-            }
+            // H4: the former blind-probe fallback (invoke every (string,int,bool)->void
+            // static and see if a password appears; pick the first remaining candidate as
+            // the clearer without any probe) invoked unverified engine methods with a
+            // path argument. On drift we abort instead - the exact names are verified
+            // for v1.0.14.
+            if (PwdSetMethod == null)
+                throw new Day0GenException("Password setter not found by exact name '" + N_PWD_SET +
+                                           "' (build drift?) - aborting (no blind-probe fallback)");
+            if (PwdClearMethod == null)
+                throw new Day0GenException("Password clearer not found by exact name '" + N_PWD_CLEAR +
+                                           "' (build drift?) - aborting (no blind-probe fallback)");
 
             // --- Save I/O --------------------------------------------------------
             SaveWriterMethod = ManagerType.GetMethod(Unescape(N_SAVEWRITER),
                 BindingFlags.Instance | BindingFlags.NonPublic);
             if (SaveWriterMethod != null) Found("game-native save writer (path)->void [writes zxsav+zxcheck]", "exact-name", SaveWriterMethod);
-            else Log.Write("NOTE: game-native save writer not found by exact name; manual composition fallback will be used");
+            else Log.Write("NOTE: game-native save writer not found by exact name; only reachable as the C1 fallback");
+
+            // C1: the game's own save entry point - FixFileName(name), pause the engine,
+            // ZXLevelState.PreSave, the native writer, unpause. This is the primary
+            // writer; the low-level writer above is only a drift fallback.
+            foreach (MethodInfo m in ManagerType.GetMethods(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (m.Name != Unescape(N_SAVE_WRAPPER)) continue;
+                ParameterInfo[] p = m.GetParameters();
+                if (p.Length == 4 && p[0].ParameterType == typeof(string) && p[1].ParameterType == typeof(Action)
+                    && p[2].ParameterType == typeof(bool) && p[3].ParameterType == typeof(bool))
+                {
+                    SaveStateWrapperMethod = m;
+                    break;
+                }
+            }
+            if (SaveStateWrapperMethod != null)
+                Found("game SaveState wrapper (name, callback, showWindow, preSave) [pause + PreSave + native writer]",
+                      "exact-name", SaveStateWrapperMethod);
+            else
+                Log.Write("WARNING: game SaveState wrapper not found by exact name '" + N_SAVE_WRAPPER +
+                          "'; the legacy direct-writer fallback (no pause/PreSave) will be used if reached.");
 
             SavesFolderMethod = ManagerType.GetMethod(Unescape(N_SAVES_FOLDER),
                 BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
@@ -866,8 +852,16 @@ namespace Day0Gen
             }
             if (ZipReadMethod != null) Found("ZipSerializer.Read(path,entry)", "signature-scan", ZipReadMethod);
             if (ZipWriteMethod != null) Found("ZipSerializer.Write(path,k1,v1,k2,v2)", "signature-scan", ZipWriteMethod);
-            if (ZipWriteMethod == null && SaveWriterMethod == null)
-                throw new Day0GenException("Neither native save writer nor ZipSerializer.Write available");
+            if (SaveStateWrapperMethod == null && SaveWriterMethod == null && ZipWriteMethod == null)
+                throw new Day0GenException("No save writer available: SaveState wrapper, native save writer and ZipSerializer.Write all missing");
+            if (SaveStateWrapperMethod == null && SaveWriterMethod == null)
+            {
+                // M1: manual composition is the only remaining writer; its dependency
+                // is a hard requirement (a null MethodBase would NRE opaquely later).
+                if (StateInfoMethod == null)
+                    throw new Day0GenException("Manual-save dependency missing: ZXGameState info-builder not found " +
+                                               "(required when manual composition is the only writer)");
+            }
 
             // --- ZXGameStateInfo + ZXFile<T> reader -------------------------------------
             GameStateInfoType = TabAssembly.GetType("ZX.ZXGameStateInfo", false);
@@ -1105,26 +1099,6 @@ namespace Day0Gen
             }
             Log.Write("SETPROP OK " + purpose);
         }
-
-        // Probes a (string,int,bool)->void candidate; returns true when it sets a
-        // non-empty ZipSerializer.Current.Password (i.e. it is the setter).
-        private bool ProbePasswordCandidate(MethodInfo cand)
-        {
-            try
-            {
-                int flag = (int)FlagMethod.Invoke(null, new object[] { @"C:\day0gen-probe.zxsav" });
-                cand.Invoke(null, new object[] { @"C:\day0gen-probe.zxsav", flag, true });
-                object zip = ZipCurrentProp.GetValue(null, null);
-                if (zip == null) return false;
-                string pwd = (string)ZipPasswordProp.GetValue(zip, null);
-                return pwd != null && pwd.Length > 0;
-            }
-            catch (Exception e)
-            {
-                Log.Write("probe candidate " + cand.Name + " threw: " + e.Message);
-                return false;
-            }
-        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1343,6 +1317,20 @@ namespace Day0Gen
 
         private static void ZombieInit()
         {
+            // H3: the Account.zxuser gate MUST run before ANY engine code executes.
+            // The zombie manager ctor (engine thread, during the singleton poll below)
+            // auto-creates + saves a fresh account when the file is missing, so a
+            // post-init existence check would pass against the very file the engine
+            // just wrote - and in phases without snapshots that write is invisible.
+            // The check only depends on EffectiveSavesDir (manager not up yet - the
+            // documented default/override path), never on engine state.
+            string accountFile = Path.Combine(RootDirOf(EffectiveSavesDir()), "Account.zxuser");
+            if (!File.Exists(accountFile))
+                throw new Day0GenException("Account.zxuser not found at " + accountFile +
+                                           " - refusing to start the engine (the manager ctor would auto-create it; " +
+                                           "the GameAccount getter would create + save a fresh account file).");
+            Log.Write("Account gate (pre-engine): " + accountFile + " exists.");
+
             // Empty args = a normal launch: the engine runs its own startup in-process
             // and reaches the main menu, which is what populates DXProject.Current.
             // TABSAT passes new string[] { "" }; that empty-string arg makes the engine
@@ -1406,14 +1394,8 @@ namespace Day0Gen
                 throw new Day0GenException("Zombie engine init timed out (manager singleton null). See ZXLog tail above.");
             }
 
-            // Account check: only read the GameAccount property once we know the
-            // account file exists - the getter would otherwise CREATE and save a
-            // fresh account, which we must never do.
-            string root = RootDirOf(EffectiveSavesDir());
-            string accountFile = Path.Combine(root, "Account.zxuser");
-            if (!File.Exists(accountFile))
-                throw new Day0GenException("Account.zxuser not found at " + accountFile +
-                                           " - refusing to touch GameAccount (getter would create a new account file).");
+            // The account file was verified to exist BEFORE the engine started (H3),
+            // so reading GameAccount now cannot create + save a fresh account.
             object account = refl.GetProp("manager.GameAccount", refl.GameAccountProp, managerInstance);
             if (account == null)
                 throw new Day0GenException("GameAccount is null even though " + accountFile + " exists.");
@@ -1531,23 +1513,9 @@ namespace Day0Gen
             Log.Write("THEME REBUILD: starting (engine ready; rebuilding the ZXMapTheme static table " +
                       "from scratch).");
 
-            // (a) locate the static private dictionary field: exact obfuscated name
-            // first, then the fallback - the static field typed
-            // Dictionary<ZXMapThemeType, ZXMapTheme>.
-            FieldInfo field = refl.MapThemeType.GetField(GameReflector.Unescape(N_THEME_TABLE_FIELD),
-                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-            if (field == null)
-            {
-                Type expected = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeEnum, refl.MapThemeType);
-                foreach (FieldInfo f in refl.MapThemeType.GetFields(
-                    BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
-                {
-                    if (f.FieldType == expected) { field = f; break; }
-                }
-                if (field != null)
-                    Log.Write("THEME REBUILD: exact-name lookup missed; fallback found static field '" +
-                              field.Name + "' : " + field.FieldType.FullName);
-            }
+            // (a) locate the static private dictionary field (exact obfuscated name,
+            // then the typed-static-field fallback).
+            FieldInfo field = FindThemeTableField();
             if (field == null)
                 throw new Day0GenException("ZXMapTheme static theme-table field not found (neither exact " +
                                            "name '" + N_THEME_TABLE_FIELD + "' nor the Dictionary<" +
@@ -1620,6 +1588,67 @@ namespace Day0Gen
                 throw new Day0GenException("Rebuilt theme table has only " + dict.Count +
                                            " entr(ies); at least 4 required (BR/AL/TM/DS)");
             Log.Write("Theme table OK (" + dict.Count + " themes, every entry verified).");
+        }
+
+        // Static theme-table field locator shared by RebuildAndVerifyThemeTable and
+        // ReVerifyThemeTableQuick: exact obfuscated name first, then the unique static
+        // field typed Dictionary<ZXMapThemeType, ZXMapTheme>.
+        private static FieldInfo FindThemeTableField()
+        {
+            FieldInfo field = refl.MapThemeType.GetField(GameReflector.Unescape(N_THEME_TABLE_FIELD),
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (field != null) return field;
+            Type expected = typeof(Dictionary<,>).MakeGenericType(refl.MapThemeEnum, refl.MapThemeType);
+            foreach (FieldInfo f in refl.MapThemeType.GetFields(
+                BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (f.FieldType == expected)
+                {
+                    Log.Write("THEME: exact-name field lookup missed; fallback found static field '" +
+                              f.Name + "' : " + f.FieldType.FullName);
+                    return f;
+                }
+            }
+            return null;
+        }
+
+        // ---------------------------------------------------------------------
+        // H5: cheap re-verification of the ZXMapTheme static table, called
+        // immediately BEFORE the generator invoke (full + genprobe). Between the
+        // rebuild (pre-construction) and the generator, seconds of engine-side
+        // scene activity pass; this closes the re-poisoning window to microseconds.
+        // It reads the static FIELD directly - the lazy getter would only rebuild on
+        // null and reading the field invokes no engine code at all - and aborts on
+        // null table, <4 entries, or any entry with a null NumDoomVillages (the
+        // exact poisoned shape that NREs the generator).
+        // ---------------------------------------------------------------------
+        private static void ReVerifyThemeTableQuick()
+        {
+            FieldInfo field = FindThemeTableField();
+            if (field == null)
+                throw new Day0GenException("ReVerifyThemeTableQuick: theme-table field not found");
+            object table = field.GetValue(null);
+            System.Collections.IDictionary dict = table as System.Collections.IDictionary;
+            if (dict == null)
+                throw new Day0GenException("ReVerifyThemeTableQuick: theme table is null or not a dictionary (" +
+                                           DescribeValue(table) + ") - re-poisoned after rebuild; aborting before generator");
+            if (dict.Count < 4)
+                throw new Day0GenException("ReVerifyThemeTableQuick: theme table has only " + dict.Count +
+                                           " entr(ies) (>=4 required) - re-poisoned after rebuild; aborting before generator");
+            PropertyInfo ndvProp = FindPropertyUp(refl.MapThemeType, "NumDoomVillages");
+            if (ndvProp == null)
+                throw new Day0GenException("ReVerifyThemeTableQuick: ZXMapTheme.NumDoomVillages property not found");
+            foreach (System.Collections.DictionaryEntry ent in dict)
+            {
+                object theme = ent.Value;
+                if (theme == null)
+                    throw new Day0GenException("ReVerifyThemeTableQuick: theme entry [" + ent.Key +
+                                               "] is null - re-poisoned after rebuild; aborting before generator");
+                if (SafePropGet(ndvProp, theme) == null)
+                    throw new Day0GenException("ReVerifyThemeTableQuick: theme " + ent.Key +
+                                               " has null NumDoomVillages - re-poisoned after rebuild; aborting before generator");
+            }
+            Log.Write("THEME QUICK RE-VERIFY OK (" + dict.Count + " entr(ies), every NumDoomVillages non-null).");
         }
 
         // Null-safe property read for verification logging: a missing property or a
@@ -1715,12 +1744,19 @@ namespace Day0Gen
                     return false;
                 }
                 Log.Write("Password derived (len " + pwd.Length + ") for " + path);
-                // clear the password state again (read-only hygiene)
-                if (refl.PwdClearMethod != null)
+                // H4: "works" means the full cycle - the clear must succeed AND leave
+                // the password empty again. A probe that leaves engine state dirty has
+                // not passed; a swallowed clear failure would poison the real run.
+                refl.Invoke("password generator(clear)", refl.PwdClearMethod, null, path, flag, true);
+                string pwdAfter = (string)refl.GetProp("ZipSerializer.Password (after clear)",
+                                                       refl.ZipPasswordProp, zip);
+                if (!string.IsNullOrEmpty(pwdAfter))
                 {
-                    try { refl.Invoke("password generator(clear)", refl.PwdClearMethod, null, path, flag, true); }
-                    catch (Day0GenException e) { Log.Write("password clear failed (non-fatal): " + e.Message); }
+                    Log.Write("ZipSerializer.Password NOT empty after clear (len " + pwdAfter.Length +
+                              ") - probe failed.");
+                    return false;
                 }
+                Log.Write("Password machinery verified: set -> non-empty password, clear -> empty again.");
                 return true;
             }
             catch (Day0GenException e)
@@ -3022,6 +3058,9 @@ namespace Day0Gen
 
         private static void GenProbeStep8Generator()
         {
+            // H5: same immediate pre-generator re-verification as the full phase - the
+            // probe steps 1-7 took time and touched engine state after the rebuild.
+            ReVerifyThemeTableQuick();
             int[] waits = new int[] { 0, 5, 10 };   // seconds to sleep BEFORE attempts 2 and 3
             for (int attempt = 1; attempt <= 3; attempt++)
             {
@@ -3211,20 +3250,24 @@ namespace Day0Gen
                       SafeControlName(uiMarshal) + "'.");
 
             Exception marshalError = null;
-            bool marshalFinished = false;
+            // M4: volatile completion flag - locals cannot be volatile in C#5, so the
+            // bool lives in a holder with a volatile field.
+            VolatileBool marshalFinished = new VolatileBool();
             Thread uiWatchdog = new Thread(delegate()
             {
                 DateTime armedAt = DateTime.UtcNow;
-                while (!marshalFinished)
+                while (!marshalFinished.Value)
                 {
                     Thread.Sleep(1000);
-                    if (marshalFinished) return;
+                    if (marshalFinished.Value) return;
                     if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
                     {
-                        Log.Write("UI-thread marshal watchdog fired - engine loop not pumping " +
-                                  "(legacy dispatch; known SetLevel WaitOne deadlock mode); " +
-                                  "aborting process; " + stallNote);
-                        Environment.Exit(2);
+                        // H6: never Log.Write from a watchdog - a thread blocked in
+                        // Log.Write would block the watchdog on the same lock and the
+                        // exit below would never run.
+                        WatchdogAbort("UI-thread marshal watchdog fired - engine loop not pumping " +
+                                      "(legacy dispatch; known SetLevel WaitOne deadlock mode); " +
+                                      "aborting process; " + stallNote);
                     }
                 }
             });
@@ -3240,7 +3283,7 @@ namespace Day0Gen
             }
             finally
             {
-                marshalFinished = true;
+                marshalFinished.Value = true;
             }
             if (marshalError != null)
             {
@@ -3282,27 +3325,53 @@ namespace Day0Gen
         // stallNote tells the operator what to review afterwards.
         private static void RunWithWatchdog(string sequenceName, string stallNote, MethodInvoker body)
         {
-            bool finished = false;
+            // M4: volatile completion flag (holder - C#5 locals cannot be volatile).
+            VolatileBool finished = new VolatileBool();
             Thread watchdog = new Thread(delegate()
             {
                 DateTime armedAt = DateTime.UtcNow;
-                while (!finished)
+                while (!finished.Value)
                 {
                     Thread.Sleep(1000);
-                    if (finished) return;
+                    if (finished.Value) return;
                     if (DateTime.UtcNow - armedAt >= TimeSpan.FromMinutes(15))
                     {
-                        Log.Write("main-thread watchdog fired - " + sequenceName + " stalled for 15 min " +
-                                  "(likely SetLevel InvokeOnStartFrame/WaitOne never signaled: engine frame " +
-                                  "loop not running); aborting process; " + stallNote);
-                        Environment.Exit(2);
+                        // H6: lock-free abort path (see WatchdogAbort).
+                        WatchdogAbort("main-thread watchdog fired - " + sequenceName + " stalled for 15 min " +
+                                      "(likely SetLevel InvokeOnStartFrame/WaitOne never signaled: engine frame " +
+                                      "loop not running); aborting process; " + stallNote);
                     }
                 }
             });
             watchdog.IsBackground = true;
             watchdog.Start();
             try { body(); }
-            finally { finished = true; }
+            finally { finished.Value = true; }
+        }
+
+        // M4: completion flag holder - `volatile` guarantees the watchdog thread
+        // observes the completion write instead of hoisting the read out of its loop.
+        private sealed class VolatileBool
+        {
+            public volatile bool Value;
+        }
+
+        // H6: watchdog abort path that shares NOTHING with Log (no gate lock, no
+        // Day0Gen.log writer). A thread blocked forever inside Log.Write (full
+        // console pipe) must not be able to block the watchdog: the durable record
+        // goes to a separate file first, then stderr, then the process exits.
+        private static void WatchdogAbort(string message)
+        {
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture) +
+                          "  " + message;
+            try
+            {
+                File.AppendAllText(Path.Combine(Environment.CurrentDirectory, "Day0Gen-watchdog.log"),
+                                   line + Environment.NewLine, Encoding.UTF8);
+            }
+            catch { }
+            try { Console.Error.WriteLine(line); } catch { }
+            Environment.Exit(2);
         }
 
         // Reference-only snapshot of the engine WinForms topology, logged before
@@ -3339,6 +3408,35 @@ namespace Day0Gen
         // ---------------------------------------------------------------------
         // Phase: full — construction + generation + save + verify
         // ---------------------------------------------------------------------
+
+        // Full-path equality helper for the after-run allow-list (H1): normalize both
+        // sides, compare case-insensitively (Windows filesystem semantics).
+        private static bool SameFullPath(string a, string b)
+        {
+            string fa = Path.GetFullPath(a).TrimEnd('\\');
+            string fb = Path.GetFullPath(b).TrimEnd('\\');
+            return string.Compare(fa, fb, StringComparison.OrdinalIgnoreCase) == 0;
+        }
+
+        // M3: our own deployed artifacts in the TAB dir, excluded from the before/
+        // after snapshots. Everything else in the TAB dir is in scope - any engine
+        // write there shows up as an unexpected change and aborts the run.
+        private static readonly string[] OwnTabDirArtifacts = new string[]
+        {
+            "Day0Gen.exe", "Day0Gen.exe.config", "Day0Gen.pdb", "Day0Gen.log", "Day0Gen-watchdog.log"
+        };
+
+        private static bool IsOwnTabDirArtifact(string path)
+        {
+            string name = Path.GetFileName(path);
+            foreach (string a in OwnTabDirArtifacts)
+            {
+                if (string.Compare(name, a, StringComparison.OrdinalIgnoreCase) == 0) return true;
+            }
+            return name.StartsWith("run-day0-", StringComparison.OrdinalIgnoreCase)
+                && name.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static int RunFull()
         {
             RefuseIfGameRunning();
@@ -3353,9 +3451,15 @@ namespace Day0Gen
             if (File.Exists(target) || File.Exists(checkPath))
                 throw new Day0GenException("Refusing to overwrite: " + target + " / " + checkPath + " already exists.");
 
-            Log.Write("Snapshot BEFORE (saves dir + parent): " + savesDir + " ; " + rootDir);
+            Log.Write("Snapshot BEFORE (saves dir + parent + TAB dir): " + savesDir + " ; " + rootDir +
+                      " ; " + opts.TabDir);
             DirSnapshot before = DirSnapshot.Take(savesDir);
             before.Add(rootDir);
+            // M3: the TAB install dir is our CWD - an engine crash log/minidump written
+            // there must be visible to the diff. Our own artifacts are excluded
+            // (Day0Gen.log is appended to by this very tool; exe/config/pdb and the
+            // run-day0-*.bat launchers are static operator files).
+            before.Add(opts.TabDir, IsOwnTabDirArtifact);
 
             refl = new GameReflector();
             refl.LoadAssemblies();
@@ -3400,32 +3504,48 @@ namespace Day0Gen
             Log.Write("Snapshot AFTER ...");
             DirSnapshot after = DirSnapshot.Take(effectiveSavesDir);
             after.Add(RootDirOf(effectiveSavesDir));
+            after.Add(opts.TabDir, IsOwnTabDirArtifact);
             if (string.Compare(effectiveSavesDir, savesDir, StringComparison.OrdinalIgnoreCase) != 0)
             {
                 after.Add(savesDir);
                 after.Add(rootDir);
             }
             List<string> changes = DirSnapshot.Diff(before, after);
+            // H1: allow-list compares FULL absolute paths (case-insensitive) - exactly
+            // the two artifacts plus the engine's ZXLog.txt in the saves root. A file
+            // merely NAMED like our target in any other (sub)directory is unexpected.
+            string zxLogFull = Path.GetFullPath(ZxLogPath(effectiveSavesDir));
             List<string> unexpected = new List<string>();
+            bool targetSeen = false;
+            bool checkSeen = false;
             foreach (string c in changes)
             {
                 Log.Write("CHANGE: " + c);
                 // change lines use the "<VERB>: <path>" form; ':' cannot occur in
                 // Windows file names so the first ": " cleanly separates
                 string path = c.Substring(c.IndexOf(": ") + 2).Trim();
-                string fileName = Path.GetFileName(path);
-                bool allowed = string.Compare(fileName, opts.Name + ".zxsav", StringComparison.OrdinalIgnoreCase) == 0
-                            || string.Compare(fileName, opts.Name + ".zxcheck", StringComparison.OrdinalIgnoreCase) == 0
-                            || string.Compare(fileName, "ZXLog.txt", StringComparison.OrdinalIgnoreCase) == 0;
-                if (!allowed) unexpected.Add(c);
+                if (SameFullPath(path, target)) { targetSeen = true; continue; }
+                if (SameFullPath(path, checkPath)) { checkSeen = true; continue; }
+                if (SameFullPath(path, zxLogFull)) continue;
+                unexpected.Add(c);
             }
             if (unexpected.Count > 0)
             {
                 foreach (string u in unexpected) Log.Write("UNEXPECTED FILE CHANGE: " + u);
-                throw new Day0GenException("Unexpected file changes detected (see log). Only " + opts.Name +
-                                           ".zxsav/.zxcheck (+engine ZXLog.txt) may change.");
+                throw new Day0GenException("Unexpected file changes detected (see log). Only " + target +
+                                           " / " + checkPath + " (+engine ZXLog.txt " + zxLogFull +
+                                           ") may change.");
             }
-            if (changes.Count == 0) Log.Write("No file changes detected (unexpected for a full run - investigate).");
+            // H2: a successful full run MUST show both new artifacts in the diff. An
+            // empty diff (or a missing artifact) means the snapshot verification itself
+            // failed - that is an abort, not a log line.
+            if (changes.Count == 0)
+                throw new Day0GenException("No file changes detected after the full run - snapshot verification " +
+                                           "failed (fail closed).");
+            if (!targetSeen || !checkSeen)
+                throw new Day0GenException("Snapshot verification failed: the diff does not contain both new " +
+                                           "artifacts (target seen=" + targetSeen + ", zxcheck seen=" + checkSeen +
+                                           ") - fail closed.");
 
             Log.Write("PHASE full COMPLETE: " + target);
             Log.Write("=== Day0Gen OK ===");
@@ -3483,6 +3603,10 @@ namespace Day0Gen
             // Bracket the engine-side ZXLog output around the generation call so the
             // interleaving with the engine's own scene-change logs is visible.
             DumpZxLogTail(effectiveSavesDir, 15);
+            // H5: re-verify the theme table immediately before the generator invoke -
+            // seconds of engine scene activity passed since the rebuild; this closes
+            // the re-poisoning window to microseconds. Aborts on any poisoned shape.
+            ReVerifyThemeTableQuick();
             Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
             object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
             if (level == null)
@@ -3491,19 +3615,58 @@ namespace Day0Gen
 
             DumpZxLogTail(effectiveSavesDir, 15);
 
-            // ---- save: use the game's own writer (password + Info/Data + zxcheck) --
-            Log.Write("Writing save: " + target);
-            if (refl.SaveWriterMethod != null)
+            // ---- save: the game's own SaveState wrapper (C1) ------------------------
+            // The wrapper (=zSV0_oCta8rEv(name, callback, showWindow, preSave)) is what
+            // the game itself calls: FixFileName(name), pause the engine,
+            // ZXLevelState.PreSave (LevelEntities / CurrentGeneratedLevel.Entities /
+            // ExtraEntities / camera areas - the state every game-written save has),
+            // the native writer (password + Info/Data + zxcheck), unpause. Writing via
+            // the low-level writer directly produced a ZXLevelState shape no
+            // game-written save has ever had, plus an unpaused mutation race. The
+            // wrapper computes the target itself (SavesFolder() + name) and SWALLOWS
+            // writer exceptions (DXLog + error dialog + return), so the existence
+            // checks below are mandatory, not cosmetic.
+            if (refl.SaveStateWrapperMethod != null)
             {
-                refl.Invoke("manager save writer (native)", refl.SaveWriterMethod, managerInstance, target);
+                // M1 null-guard: a null manager here is an invariant violation - abort,
+                // never silently downgrade the save path.
+                if (managerInstance == null)
+                    throw new Day0GenException("managerInstance is null - cannot invoke the SaveState wrapper");
+                Log.Write("Saving via the game's SaveState wrapper (pause + PreSave + native writer):" +
+                          " name='" + opts.Name + "', callback=null, showWindow=false, preSave=true.");
+                Log.Write("Wrapper computes its own target from the name; expected: " + target +
+                          " (zxcheck sibling: " + checkPath + ")");
+                refl.Invoke("manager SaveState(name, null, false, true)",
+                    refl.SaveStateWrapperMethod, managerInstance, opts.Name, null, false, true);
             }
             else
             {
-                Log.Write("Falling back to manual save composition (ZipSerializer.Write).");
-                ManualSave(target, gs);
+                // C1/M1 hard-error fallback: only reachable on build drift (exact-name
+                // wrapper miss). No NREs on null method bases - abort with a message.
+                Log.Write("WARNING: SaveState wrapper not found by exact name - falling back to the " +
+                          "legacy direct save path (C1 risk: no pause, no PreSave).");
+                if (managerInstance == null)
+                    throw new Day0GenException("managerInstance is null - cannot run the legacy save fallback");
+                if (refl.SaveWriterMethod != null)
+                {
+                    refl.Invoke("manager save writer (native, no PreSave) [C1 fallback]",
+                        refl.SaveWriterMethod, managerInstance, target);
+                }
+                else
+                {
+                    ManualSave(target, gs);
+                }
             }
-            if (!File.Exists(target)) throw new Day0GenException("Save writer did not produce " + target);
-            if (!File.Exists(checkPath)) throw new Day0GenException("Save writer did not produce " + checkPath);
+            if (!File.Exists(target))
+                throw new Day0GenException("Save did not produce " + target +
+                    (refl.SaveStateWrapperMethod != null
+                        ? " (the SaveState wrapper swallows writer exceptions - check ZXLog / the engine error popup)"
+                        : ""));
+            if (!File.Exists(checkPath))
+                throw new Day0GenException("Save did not produce " + checkPath +
+                    (refl.SaveStateWrapperMethod != null
+                        ? " (the SaveState wrapper swallows writer exceptions - check ZXLog / the engine error popup)"
+                        : ""));
 
             // ---- verify ------------------------------------------------------------
             string sig = (string)refl.Invoke("signing(target,2)", refl.SigningMethod, null, target, 2);
@@ -3543,6 +3706,14 @@ namespace Day0Gen
 
         private static void ManualSave(string target, object gs)
         {
+            // M1: last-resort writer - a null MethodBase would NRE inside the reflection
+            // logging preamble; abort with a clear message instead.
+            if (refl.ZipWriteMethod == null)
+                throw new Day0GenException("ManualSave fallback unavailable: ZipSerializer.Write not discovered");
+            if (refl.StateInfoMethod == null)
+                throw new Day0GenException("ManualSave fallback unavailable: ZXGameState info-builder not discovered");
+            if (refl.PwdSetMethod == null || refl.PwdClearMethod == null)
+                throw new Day0GenException("ManualSave fallback unavailable: password set/clear method not discovered");
             // Mirrors manager _0023_003DzMtGuEM2lBSlZ5BGWvg== + zxcheck writer exactly:
             // set password(path,2,false); Write(path,"Data",gs,"Info",info); clear; sign.
             refl.Invoke("password generator(set,write)", refl.PwdSetMethod, null, target, 2, false);

@@ -235,3 +235,34 @@ factors 1.0) with Name fixed to "probe".
   NOT real args — real args cause a Steam handoff + process exit. Interactive runs (a `.bat` on the
   user's desktop, `run-day0-full.bat`) behave differently from SSH session-0 runs.
 - Local build: `make build` (nix dotnet-sdk out-link `/tmp/dotnet-sdk-result`); `make audit` for C#5.
+
+## Code-review fixes (notes/code-review-1.md, commit after 384f13c) — build+audit clean, NOT deployed
+
+All blocking + recommended findings from the adversarial review implemented in `src/Day0Gen.cs`:
+
+- **C1 (critical)**: the save now goes through the game's own SaveState wrapper
+  `_0023_003DzSV0_oCta8rEv(name, callback, showWindow, preSave)` (instance on the manager,
+  discovered by exact name + (String, Action, Boolean, Boolean) signature), invoked with
+  `(opts.Name, null, false, true)` on managerInstance → FixFileName + engine pause + ZXLevelState
+  PreSave + native writer + unpause, byte-for-byte game-native. The wrapper SWALLOWS writer
+  exceptions (DXLog + error dialog + return), so post-invoke File.Exists checks on target+zxcheck
+  are mandatory and abort. Low-level writer/manual composition kept only as drift fallback with
+  M1 null-guards (abort on any null MethodBase/manager, no NREs).
+- **H1**: after-run allow-list compares FULL absolute paths (case-insensitive): target, checkPath,
+  ZXLog.txt in saves root only. No filename matching.
+- **H2**: DirSnapshot enumeration failure now throws (no partial snapshots); after a full run the
+  diff MUST contain both new artifacts (empty diff or missing artifact → abort).
+- **H3**: Account.zxuser existence gate moved to the very top of ZombieInit (before the engine
+  thread starts) — the zombie manager ctor auto-creates it otherwise.
+- **H4**: password flag/set/clear discovered by exact name only (blind probe + unprobed clearer
+  fallback deleted along with ProbePasswordCandidate); TryPasswordDerivation now requires the full
+  cycle: set → ZipSerializer.Password non-empty, clear → password empty again, else abort.
+- **H5**: new ReVerifyThemeTableQuick() (reads the static theme-table FIELD directly; non-null,
+  >=4 entries, every NumDoomVillages non-null) called immediately before the generator invoke in
+  BOTH full and genprobe (step 8) — closes the re-poisoning window after the rebuild.
+- **H6**: both watchdogs abort via WatchdogAbort(): Console.Error + File.AppendAllText to
+  Day0Gen-watchdog.log (never Log.Write / the shared gate lock), then Environment.Exit(2).
+- **M4**: watchdog completion flags now volatile (VolatileBool holder; C#5 locals can't be volatile).
+- **M3 partial**: phase-full before/after snapshots now include the TAB install dir, excluding our
+  own artifacts (Day0Gen.exe/.exe.config/.pdb/.log/-watchdog.log, run-day0-*.bat) — any other
+  engine write there aborts the run. Steam userdata subtree still NOT covered.
