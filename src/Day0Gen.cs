@@ -275,6 +275,7 @@ namespace Day0Gen
         private const string N_ADOPT_LEVEL = "_0023_003Dzf9PbDap0F6OC";
         private const string N_TABLE_LOADER_TYPE = "_0023_003Dz3Zxcp6RwVCZHa9xpeg_003D_003D";
         private const string N_TABLE_LOAD = "_0023_003DzUoK3qsRYSJTT";
+        private const string N_FOG_SYSTEM_TYPE = "_0023_003DzJme8KFhmikprnkg_2CDeiQE_003D";
 
         public Assembly TabAssembly;
         public Assembly DxAssembly;
@@ -284,6 +285,9 @@ namespace Day0Gen
                     GameStateInfoType, GeneratorType, MapThemeType, GameSystemType,
                     TableLoaderType, DxSystemType, ZipSerializerType, DxLevelType,
                     FileGenericBase;
+        // Fog system (global internal type): created by the game system's OnLoad;
+        // the ZXLevelState adoption dereferences DXSystem.Get<fogsys>().
+        public Type FogSystemType;
         public Type GameModeEnum, MapThemeEnum, ChallengeEnum;
 
         // DXVision.DXProject / .Current: the engine's scene/project context singleton.
@@ -334,7 +338,9 @@ namespace Day0Gen
 
         // Game system
         public MethodInfo SetLevelMethod;            // instance (DXLevel) -> void
+        public MethodInfo GameSystemOnLoadMethod;    // instance () -> void  [creates the fog system]
         public MethodInfo DxSystemLoadMethod;        // static generic (bool) -> T
+        public MethodInfo DxSystemGetMethod;         // static generic () -> T
 
         // ZXLevelState
         public MethodInfo AdoptLevelMethod;          // instance (DXLevel) -> void  [level adoption: SetLevel continuation]
@@ -779,6 +785,51 @@ namespace Day0Gen
                                            "(DXLevel) not found on ZXLevelState");
             Found("ZXLevelState adopt level (SetLevel continuation)", "exact-name", AdoptLevelMethod);
 
+            // --- Game-system OnLoad + fog system (enter-game transition) ------------
+            // The adoption above dereferences DXSystem.Get<fogsys>().LayerFog
+            // (ZXLevelState.cs ~line 1606) - and that fog system is created by the
+            // game system's own OnLoad (vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs
+            // line 1626). Our construction loads the game system DEFERRED
+            // (DXSystem.Load<gamesystem>(false), mirroring the real survival click
+            // handler) and the engine never ran OnLoad for the out-of-band instance
+            // - phase full invokes it itself (AdoptLevelIntoLevelState). DeclaredOnly
+            // selection: OnLoad is also declared on the DXSystem base chain; the game
+            // system's own override is the one that creates the fog system.
+            GameSystemOnLoadMethod = GameSystemType.GetMethod("OnLoad",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly);
+            if (GameSystemOnLoadMethod == null || GameSystemOnLoadMethod.GetParameters().Length != 0)
+                throw new Day0GenException("Game system OnLoad() not found (need: instance, public, " +
+                                           "0 args, declared on the game system type itself - build drift?)");
+            Found("game system OnLoad() [creates the fog system; enter-game transition]",
+                  "exact-name+DeclaredOnly", GameSystemOnLoadMethod);
+
+            // Fog system type (global internal type). Marker-scan fallback: the
+            // escaped name contains a non-ASCII identifier char, so the unescape
+            // round-trip must match the real metadata name exactly - the marker
+            // scan covers any escaping drift.
+            FogSystemType = TabAssembly.GetType(Unescape(N_FOG_SYSTEM_TYPE), false);
+            if (FogSystemType != null)
+            {
+                Found("fog system type (created by game-system OnLoad)", "exact-name", FogSystemType);
+            }
+            else
+            {
+                List<Type> markerMatches = FindTypesByMarker(TabAssembly, "zJme8KFhmikprnkg", new List<Type>());
+                if (markerMatches.Count == 0)
+                    FindTypesByMarker(DxAssembly, "zJme8KFhmikprnkg", markerMatches);
+                if (markerMatches.Count == 1)
+                {
+                    FogSystemType = markerMatches[0];
+                    Found("fog system type (created by game-system OnLoad)", "name-marker-scan", FogSystemType);
+                }
+                else
+                {
+                    throw new Day0GenException("Fog system type not resolvable: exact name '" +
+                                               N_FOG_SYSTEM_TYPE + "' missed and the marker scan found " +
+                                               markerMatches.Count + " candidate(s) (need exactly 1)");
+                }
+            }
+
             DxSystemType = DxAssembly.GetType("DXVision.DXSystem", false);
             if (DxSystemType == null) throw new Day0GenException("Type DXVision.DXSystem not found");
             Found("DXSystem type", "public-stable-name", DxSystemType);
@@ -795,6 +846,17 @@ namespace Day0Gen
             if (DxSystemLoadMethod == null)
                 throw new Day0GenException("DXSystem.Load<T>(bool) not found");
             Found("DXSystem.Load<T>(bool)", "signature-scan", DxSystemLoadMethod);
+
+            foreach (MethodInfo m in DxSystemType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (m.Name != "Get" || !m.IsGenericMethodDefinition) continue;
+                if (m.GetParameters().Length != 0) continue;
+                DxSystemGetMethod = m;
+                break;
+            }
+            if (DxSystemGetMethod == null)
+                throw new Day0GenException("DXSystem.Get<T>() not found");
+            Found("DXSystem.Get<T>()", "signature-scan", DxSystemGetMethod);
 
             // --- DXProject (engine scene/project context) --------------------------------
             // ZXLevelState's ctor reads DXProject.Current; it is populated by the engine's
@@ -981,6 +1043,22 @@ namespace Day0Gen
                           rtle.Types.Length + " loaded, " + rtle.LoaderExceptions.Length + " failed)");
                 return rtle.Types;
             }
+        }
+
+        // Marker-based type locator (fallback for obfuscated names whose escaped
+        // form contains non-ASCII chars): every type whose FullName carries the
+        // marker. Used by the fog-system type fallback in DiscoverAll.
+        private static List<Type> FindTypesByMarker(Assembly asm, string marker, List<Type> into)
+        {
+            foreach (Type t in SafeGetTypes(asm))
+            {
+                if (t == null) continue;
+                string fn = null;
+                try { fn = t.FullName; } catch { }
+                if (fn != null && fn.IndexOf(marker, StringComparison.Ordinal) >= 0)
+                    into.Add(t);
+            }
+            return into;
         }
 
         private void EnsureZipSerializer()
@@ -2268,7 +2346,8 @@ namespace Day0Gen
         // sees it; at throw time the CLR may still have frames.
         // Filter: NullReferenceException / KeyNotFoundException / IndexOutOfRangeException
         // whose stack mentions the generator class, the game-system class
-        // (zxRcpu6e7NYzT7tGWqPjpOkc=) or the DXVision map types; stackless
+        // (zxRcpu6e7NYzT7tGWqPjpOkc=), the DXVision map types, or the level-state /
+        // fog-system / DXSystem frames of the adopt + OnLoad chain; stackless
         // exceptions of those types are logged too (marked) - the stackless NRE is
         // precisely the failure under investigation. Tiny + fully guarded: this runs
         // on EVERY first-chance exception in the process until unregistered.
@@ -2304,7 +2383,10 @@ namespace Day0Gen
                         && st.IndexOf("zxRcpu6e7NYzT7tGWqPjpOkc=", StringComparison.Ordinal) < 0
                         && st.IndexOf("DXNoyseLayer", StringComparison.Ordinal) < 0
                         && st.IndexOf("DXWorldGrid", StringComparison.Ordinal) < 0
-                        && st.IndexOf("ZXMapDrawer", StringComparison.Ordinal) < 0)
+                        && st.IndexOf("ZXMapDrawer", StringComparison.Ordinal) < 0
+                        && st.IndexOf("ZXLevelState", StringComparison.Ordinal) < 0
+                        && st.IndexOf("zJme8KFhmikprnkg", StringComparison.Ordinal) < 0
+                        && st.IndexOf("DXSystem", StringComparison.Ordinal) < 0)
                         return;
                     genProbeFceLogged++;
                     Log.Write("FCE: " + tn + ": " + ex.Message);
@@ -2315,7 +2397,7 @@ namespace Day0Gen
             };
             AppDomain.CurrentDomain.FirstChanceException += genProbeFce;
             Log.Write("FCE handler registered (first-chance NRE/KeyNotFound/IndexOutOfRange filter, " +
-                      "generator + game-system + DXVision map-type stacks).");
+                      "generator + game-system + DXVision map-type + level-state/fog/DXSystem stacks).");
         }
 
         // Second half of the FCE diagnostic (run for EVERY filtered exception,
@@ -3765,7 +3847,8 @@ namespace Day0Gen
             // The 17:39 run proved the scene-object NRE escapes BEFORE SetLevel's
             // new-level branch reaches the ZXLevelState adoption - the state PreSave
             // dereferences (CurrentGeneratedLevel) was never built. Complete it here.
-            AdoptLevelIntoLevelState(ls, level);
+            // (sys is needed for step (b): the game system's OnLoad.)
+            AdoptLevelIntoLevelState(ls, sys, level);
 
             DumpZxLogTail(effectiveSavesDir, 15);
 
@@ -3986,10 +4069,14 @@ namespace Day0Gen
         // this step fixes), LevelEntities reset, LayerFog/LayerActivity, game time 0,
         // starting resources Gold += 100 / Wood += 20. Steps: (a) DXLevel.Current must
         // reference our level (the adoption dereferences it for the IsInProject gate
-        // and the CurrentGeneratedLevel source); (b) invoke the adoption on our ls;
-        // (c) verify the postconditions PreSave depends on.
+        // and the CurrentGeneratedLevel source); (b) run the game system's OnLoad on
+        // our sys and verify DXSystem.Get<fogsys>() is non-null (17:53 run: the
+        // adoption NRE'd 3ms in because the fog system did not exist - deferred
+        // DXSystem.Load<gamesystem>(false) means OnLoad is engine-triggered in the
+        // real game, and our out-of-band instance never got it); (c) invoke the
+        // adoption on our ls; (d) verify the postconditions PreSave depends on.
         // ---------------------------------------------------------------------
-        private static void AdoptLevelIntoLevelState(object ls, object level)
+        private static void AdoptLevelIntoLevelState(object ls, object sys, object level)
         {
             Log.Write("ADOPT: adopting the generated level into ZXLevelState (SetLevel continuation) ...");
 
@@ -4025,7 +4112,41 @@ namespace Day0Gen
                 Log.Write("ADOPT: DXLevel.Current already references the generated level (precondition OK).");
             }
 
-            // (b) Invoke the adoption. The guard mirrors SetLevel's own branch
+            // (b) Game-system OnLoad: the engine's own enter-game transition. The
+            // adoption dereferences DXSystem.Get<fogsys>() (ZXLevelState.cs ~1606)
+            // and that system is created by OnLoad (DXSystem.Load<fogsys>(true)).
+            // We load the game system deferred (DXSystem.Load<gamesystem>(false),
+            // like the real survival click handler); in the real game the ENGINE
+            // triggers OnLoad in its load cycle - our out-of-band instance never got
+            // it, so the 17:53 run's adoption NRE'd 3ms in on the missing fog
+            // system. OnLoad also disposes the menu UI system (the game's own
+            // enter-game transition) - acceptable: this process exits right after
+            // the save.
+            try
+            {
+                refl.Invoke("gamesystem.OnLoad() [creates the fog system]",
+                            refl.GameSystemOnLoadMethod, sys);
+            }
+            catch (Day0GenException e)
+            {
+                LogExceptionChain("GAME SYSTEM ONLOAD", e);
+                throw new Day0GenException("Game-system OnLoad failed - the fog system the adoption " +
+                                           "dereferences cannot be created; aborting before any save is written.", e);
+            }
+
+            // OnLoad verification: DXSystem.Get<fogsys>() must now return the fog
+            // system - null is the exact precondition of the 17:53 adoption NRE
+            // (the adopt would NRE on the LayerFog fetch).
+            object fogSystem = refl.Invoke("DXSystem.Get<fogsys>() (post-OnLoad verify)",
+                refl.DxSystemGetMethod.MakeGenericMethod(refl.FogSystemType), null);
+            Log.Write("ADOPT VERIFY: DXSystem.Get<fogsys>() after OnLoad -> " +
+                      (fogSystem == null ? "null" : fogSystem.GetType().FullName));
+            if (fogSystem == null)
+                throw new Day0GenException("DXSystem.Get<fogsys>() is null after game-system OnLoad - " +
+                                           "the fog system was not created and the adoption would NRE " +
+                                           "(17:53 root cause); aborting before any save is written.");
+
+            // (c) Invoke the adoption. The guard mirrors SetLevel's own branch
             // condition (the statement only runs when IDCurrentMission != level.ID):
             // on a CLEAN SetLevel path the engine already adopted, and invoking again
             // would double the day-0 starting resources (Gold += 100 / Wood += 20 a
@@ -4058,7 +4179,7 @@ namespace Day0Gen
                 }
             }
 
-            // (c) Postconditions: the state PreSave dereferences.
+            // (d) Postconditions: the state PreSave dereferences.
             missionId = Convert.ToUInt64(refl.GetProp(
                 "ls.IDCurrentMission (adopt verify)", missionProp, ls));
             Log.Write("ADOPT VERIFY: IDCurrentMission=" + missionId.ToString() +

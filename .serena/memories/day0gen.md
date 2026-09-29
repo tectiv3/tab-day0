@@ -296,6 +296,29 @@ factors 1.0) with Name fixed to "probe".
       CurrentGeneratedLevel ReferenceEquals level; LevelEntities null; log Gold/Wood
       (expect +100/+20 on top of ctor defaults - log only, NOT asserted). Abort on any
       check failure. Live re-test pending.
+13. **Adopt NRE root cause = missing fog system (17:53 run):** the adoption
+    `#=zf9PbDap0F6OC` NRE'd 3ms in at `LayerFog = DXSystem.Get<fogsys>().#=zwJQaMvq$T3G4`
+    (ZXLevelState.cs ~1606) because `DXSystem.Get<fogsys>()` returned NULL - the fog
+    system does not exist. What creates it in the real game: the game system's OnLoad
+    (vendor/decompiled/--zxRcpu6e7NYzT7tGWqPjpOkc-.cs line 1626): `base.OnLoad();
+    Enabled=false; DXSystem.Dispose<menu-system>(); DXSystem.Dispose<fogsys>();
+    DXSystem.Load<fogsys>(true); DXSystem.Get<fogsys>().Enabled=false;` plus dispose/load
+    of two more systems. We created the game system via `DXSystem.Load<gamesystem>(false)`
+    (deferred, like the real survival click handler), but the engine never ran OnLoad for
+    our out-of-band instance - deferred Load(false) means OnLoad is ENGINE-triggered in
+    the real game. Note OnLoad also DISPOSES the menu UI system - that is the game's own
+    enter-game transition; acceptable: our process exits right after saving. Fix in
+    `src/Day0Gen.cs` (build+audit clean, NOT deployed): `AdoptLevelIntoLevelState` now
+    takes the game system instance; after the DXLevel.Current precondition and before
+    the adopt invoke it (b) invokes OnLoad on the game system (exact name "OnLoad",
+    instance, public, 0 args, DeclaredOnly on the game system type - discovered as
+    `GameSystemOnLoadMethod`) with the full chain logged on failure, then verifies
+    `DXSystem.Get<fogsys>()` non-null (Get = DXSystem static generic 0-arg,
+    `DxSystemGetMethod`; fog type = TabAssembly global type
+    `_0023_003DzJme8KFhmikprnkg_2CDeiQE_003D`, fallback: unique loaded type whose full
+    name contains "zJme8KFhmikprnkg"); null aborts (adopt would NRE). FCE stack filter
+    extended with "ZXLevelState" / "zJme8KFhmikprnkg" / "DXSystem" so any further NRE in
+    this chain logs its IL offset. Live re-test pending.
 
 ## Project memory / tooling
 
