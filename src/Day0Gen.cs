@@ -12,8 +12,10 @@
 // see DispatchSequence). The legacy Control.Invoke marshal onto the engine UI
 // thread is kept behind --ui-marshal for A/B testing (may deadlock in SetLevel).
 //
-// Phases: discovery | zombie | genprobe (generator diagnostic) | full (later
-// phases imply earlier ones; genprobe is a read-only diagnostic, see RunGenProbe).
+// Subcommands: seed | save | discovery | zombie | genprobe (generator diagnostic);
+// the legacy `--phase full|discovery|zombie|genprobe` form is kept as an alias
+// (`full` == `seed`). Later phases imply earlier ones; genprobe is a read-only
+// diagnostic, see RunGenProbe.
 
 using System;
 using System.Collections.Generic;
@@ -80,7 +82,12 @@ namespace Day0Gen
     // ---------------------------------------------------------------------------
     internal sealed class Options
     {
-        public string Phase = null;                     // discovery | zombie | genprobe | full
+        // Subcommand selected as args[0] (new CLI) or via --phase (legacy alias).
+        // Values: seed | save | discovery | zombie | genprobe. "full" is folded
+        // into "seed" so `--phase full` keeps working byte-for-byte.
+        public string Command = null;
+        public string Phase = null;                     // legacy --phase selector
+        public string FromSave = null;                  // save mode: source .zxsav path
         public string TabDir = @"C:\Program Files (x86)\Steam\steamapps\common\They Are Billions";
         public string SavesDir = null;                  // null => default / manager-discovered
         public bool SavesDirExplicit = false;
@@ -88,7 +95,15 @@ namespace Day0Gen
         public int NCells = 256;
         public float Duration = 1.0f;
         public float Pop = 1.0f;
-        public string Name = "CC 550040233";
+        // null => keep today's CC-parity default (ThemeType=None, DifficultyType
+        // untouched). save mode fills these from the source SurvivalModeParams
+        // unless the corresponding flag was given explicitly.
+        public string Difficulty = null;
+        public string Theme = null;
+        public bool SeedExplicit = false, NCellsExplicit = false,
+                    DurationExplicit = false, PopExplicit = false,
+                    DifficultyExplicit = false, ThemeExplicit = false;
+        public string Name = null;                      // default depends on subcommand
         public string ValidateSigner = null;
         public bool UiMarshal = false;                 // legacy dispatch (A/B only; may deadlock in SetLevel)
 
@@ -102,9 +117,16 @@ namespace Day0Gen
         public static Options Parse(string[] args)
         {
             Options o = new Options();
+            // New-style subcommand: args[0] when it is not a --flag. --phase stays
+            // the legacy selector and is resolved alongside it below.
+            int i = 0;
+            if (args.Length > 0 && args[0].Length > 0 && args[0][0] != '-')
+            {
+                o.Command = args[0];
+                i = 1;
+            }
             // Every flag takes exactly one value (consumed in pairs) except the
             // valueless --ui-marshal.
-            int i = 0;
             while (i < args.Length)
             {
                 string a = args[i];
@@ -120,22 +142,56 @@ namespace Day0Gen
                 if (!hasVal)
                     throw new Day0GenException("Missing value for " + a);
                 if (a == "--phase") o.Phase = v;
+                else if (a == "--from") o.FromSave = v;
                 else if (a == "--tab-dir") o.TabDir = v;
                 else if (a == "--saves-dir") { o.SavesDir = v; o.SavesDirExplicit = true; }
-                else if (a == "--seed") o.Seed = ParseInt(v, a);
-                else if (a == "--ncells") o.NCells = ParseInt(v, a);
-                else if (a == "--duration") o.Duration = ParseFloat(v, a);
-                else if (a == "--pop") o.Pop = ParseFloat(v, a);
-                else if (a == "--name") o.Name = v;
+                else if (a == "--seed") { o.Seed = ParseInt(v, a); o.SeedExplicit = true; }
+                else if (a == "--ncells") { o.NCells = ParseInt(v, a); o.NCellsExplicit = true; }
+                else if (a == "--duration") { o.Duration = ParseFloat(v, a); o.DurationExplicit = true; }
+                else if (a == "--pop") { o.Pop = ParseFloat(v, a); o.PopExplicit = true; }
+                else if (a == "--difficulty") { o.Difficulty = v; o.DifficultyExplicit = true; }
+                else if (a == "--theme") { o.Theme = v; o.ThemeExplicit = true; }
+                else if (a == "--name") { o.Name = v; }
                 else if (a == "--validate-signer") o.ValidateSigner = v;
                 else throw new Day0GenException("Unknown argument: " + a);
                 i += 2;
             }
-            if (o.Phase == null)
-                throw new Day0GenException("--phase discovery|zombie|genprobe|full is required");
-            o.Phase = o.Phase.ToLowerInvariant();
-            if (o.Phase != "discovery" && o.Phase != "zombie" && o.Phase != "genprobe" && o.Phase != "full")
-                throw new Day0GenException("Invalid --phase '" + o.Phase + "' (discovery|zombie|genprobe|full)");
+
+            string cmd = o.Command != null ? o.Command : o.Phase;
+            if (cmd == null)
+                throw new Day0GenException("A subcommand is required: seed|save|discovery|zombie|genprobe " +
+                                           "(legacy: --phase full|discovery|zombie|genprobe).");
+            cmd = cmd.ToLowerInvariant();
+            if (cmd == "full") cmd = "seed";             // backward-compatible alias
+            if (cmd != "seed" && cmd != "save" && cmd != "discovery" && cmd != "zombie" && cmd != "genprobe")
+                throw new Day0GenException("Unknown subcommand/phase '" + cmd +
+                                           "'. Expected seed|save|discovery|zombie|genprobe.");
+            o.Command = cmd;
+
+            bool legacyPhaseFull = (o.Phase != null);
+            if (cmd == "seed")
+            {
+                // The new subcommand requires an explicit --seed; the legacy
+                // `--phase full` form keeps its historical default so the existing
+                // operator launcher (--phase full --name "CC ...") keeps working.
+                if (!o.SeedExplicit && !legacyPhaseFull)
+                    throw new Day0GenException("seed: --seed is required (or use --phase full for the legacy default).");
+                if (o.Name == null) o.Name = "Day0 " + o.Seed;
+            }
+            else if (cmd == "save")
+            {
+                if (o.FromSave == null || o.FromSave.Trim().Length == 0)
+                    throw new Day0GenException("save: --from <path.zxsav> is required.");
+                if (!File.Exists(o.FromSave))
+                    throw new Day0GenException("save: source save not found: " + o.FromSave);
+                // Deliberately NOT the source name: the tool refuses to overwrite.
+                if (o.Name == null) o.Name = Path.GetFileNameWithoutExtension(o.FromSave) + " (Day0)";
+            }
+            else if (o.Name == null)
+            {
+                o.Name = "Day0";
+            }
+
             if (o.NCells < 64 || o.NCells > 512)
                 throw new Day0GenException("--ncells out of range [64,512]");
             if (o.Name == null || o.Name.Trim().Length == 0)
@@ -299,7 +355,7 @@ namespace Day0Gen
         // Fog system (global internal type): created by the game system's OnLoad;
         // the ZXLevelState adoption dereferences DXSystem.Get<fogsys>().
         public Type FogSystemType;
-        public Type GameModeEnum, MapThemeEnum, ChallengeEnum;
+        public Type GameModeEnum, MapThemeEnum, ChallengeEnum, DifficultyEnum;
 
         // DXVision.DXProject / .Current: the engine's scene/project context singleton.
         // Current may be exposed as a property or a field depending on the build.
@@ -738,9 +794,18 @@ namespace Day0Gen
                     throw new Day0GenException("ZXRandomLevelParams property missing/not writable: " + pn);
                 Found("ZXRandomLevelParams." + pn, "public-stable-name", p);
             }
-            // DifficultyType is deliberately NOT set (default None), but verify it exists.
-            if (ParamsType.GetProperty("DifficultyType") == null)
+            // DifficultyType is left at its default (None) unless --difficulty is given,
+            // but its enum type is discovered from the property (never hardcoded) so
+            // the explicit setter can validate and parse names.
+            PropertyInfo difficultyProp = ParamsType.GetProperty("DifficultyType");
+            if (difficultyProp == null)
                 throw new Day0GenException("ZXRandomLevelParams.DifficultyType missing");
+            DifficultyEnum = difficultyProp.PropertyType;
+            if (!DifficultyEnum.IsEnum)
+                throw new Day0GenException("ZXRandomLevelParams.DifficultyType is not an enum type: " +
+                                           DifficultyEnum.FullName);
+            Found("enum " + DifficultyEnum.Name + " (DifficultyType property type)",
+                  "property-type", DifficultyEnum);
             if (ParamsType.GetConstructor(new Type[0]) == null)
                 throw new Day0GenException("ZXRandomLevelParams ctor() not found");
 
@@ -1483,9 +1548,9 @@ namespace Day0Gen
 
             try
             {
-                if (opts.Phase == "discovery") return RunDiscovery();
-                if (opts.Phase == "zombie") return RunZombie();
-                if (opts.Phase == "genprobe") return RunGenProbe();
+                if (opts.Command == "discovery") return RunDiscovery();
+                if (opts.Command == "zombie") return RunZombie();
+                if (opts.Command == "genprobe") return RunGenProbe();
                 return RunFull();
             }
             catch (Day0GenException e)
@@ -1493,14 +1558,14 @@ namespace Day0Gen
                 Log.Write("ABORT: " + e.Message);
                 if (e.InnerException != null)
                     Log.Write("  caused by: " + e.InnerException.GetType().Name + ": " + e.InnerException.Message);
-                Log.Write("=== Day0Gen FAILED (phase " + opts.Phase + ") ===");
+                Log.Write("=== Day0Gen FAILED (phase " + opts.Command + ") ===");
                 return 1;
             }
             catch (Exception e)
             {
                 Log.Write("ABORT (unexpected): full exception chain follows.");
                 LogExceptionChain("ABORT", e);
-                Log.Write("=== Day0Gen FAILED (phase " + opts.Phase + ") ===");
+                Log.Write("=== Day0Gen FAILED (phase " + opts.Command + ") ===");
                 return 1;
             }
         }
@@ -1520,13 +1585,101 @@ namespace Day0Gen
 
         private static string Usage()
         {
-            return "Day0Gen --phase discovery|zombie|genprobe|full [--tab-dir <dir>] [--saves-dir <dir>] [--seed N]\r\n"
-                 + "        [--ncells N] [--duration F] [--pop F] [--name S] [--validate-signer <zxsav>] [--ui-marshal]\r\n"
-                 + "        (--ui-marshal: legacy dispatch onto the engine WinForms UI thread via\r\n"
-                 + "         Control.Invoke - A/B testing only, may deadlock in SetLevel; default runs\r\n"
-                 + "         the sequence on the main tool thread)\r\n"
-                 + "        (genprobe: interactive generator diagnostic; zombie init + probe sequence;\r\n"
-                 + "         writes nothing besides Day0Gen.log)";
+            return "Day0Gen <command> [options]\r\n"
+                 + "\r\n"
+                 + "Commands:\r\n"
+                 + "  seed       generate a day-0 survival save; requires --seed\r\n"
+                 + "             (legacy `--phase full` keeps its default seed)\r\n"
+                 + "  save       regenerate from a source save's SurvivalModeParams; requires --from\r\n"
+                 + "  discovery  reflection target discovery (read-only)\r\n"
+                 + "  zombie     engine init + account/password/signer verification (read-only)\r\n"
+                 + "  genprobe   interactive generator diagnostic; writes nothing besides Day0Gen.log\r\n"
+                 + "\r\n"
+                 + "Common options:\r\n"
+                 + "  [--name S] [--ncells N] [--duration F] [--pop F]\r\n"
+                 + "  [--difficulty <enum>] [--theme <enum>] [--tab-dir <dir>] [--saves-dir <dir>]\r\n"
+                 + "  [--validate-signer <zxsav>] [--ui-marshal]\r\n"
+                 + "  seed --name defaults to 'Day0 <seed>'; save --name to '<source> (Day0)'\r\n"
+                 + "  save derives seed/ncells/duration/pop/difficulty/theme from the source;\r\n"
+                 + "       explicit flags override the save-derived values\r\n"
+                 + "  --difficulty/--theme take an enum name; invalid names list valid values\r\n"
+                 + "\r\n"
+                 + "Legacy: --phase full == seed; --phase discovery|zombie|genprobe unchanged.\r\n"
+                 + "(--ui-marshal: legacy dispatch onto the engine WinForms UI thread via\r\n"
+                 + " Control.Invoke - A/B testing only, may deadlock in SetLevel; default runs\r\n"
+                 + " the sequence on the main tool thread)";
+        }
+
+        // ---------------------------------------------------------------------
+        // save mode: derive the six generation params from the source save's
+        // SurvivalModeParams (the .zxsav IS a serialized ZXGameState). Explicit CLI
+        // flags override the save-derived value. A missing member or unreadable save
+        // aborts (fail closed) rather than silently generating with defaults.
+        // ---------------------------------------------------------------------
+        private static void ApplySaveParams()
+        {
+            string path = Path.GetFullPath(opts.FromSave);
+            Log.Write("SAVE EXTRACT: reading source save: " + path);
+            object gs = ReadGameStateFromSave(path);
+            if (gs == null)
+                throw new Day0GenException("save: reading " + path + " returned a null ZXGameState.");
+
+            PropertyInfo smpProp = refl.GameStateType.GetProperty("SurvivalModeParams");
+            if (smpProp == null)
+                throw new Day0GenException("save: ZXGameState.SurvivalModeParams property not found.");
+            object p = smpProp.GetValue(gs, null);
+            if (p == null)
+                throw new Day0GenException("save: source save has null SurvivalModeParams (not a survival save): " + path);
+
+            object seed = ReadRequiredParam(p, "Seed");
+            object ncells = ReadRequiredParam(p, "NCells");
+            object duration = ReadRequiredParam(p, "FactorGameDuration");
+            object pop = ReadRequiredParam(p, "FactorZombiePopulation");
+            object difficulty = ReadRequiredParam(p, "DifficultyType");
+            object theme = ReadRequiredParam(p, "ThemeType");
+
+            Log.Write("SAVE EXTRACT: source SurvivalModeParams -> Seed=" + seed + ", NCells=" + ncells +
+                      ", FactorGameDuration=" + duration + ", FactorZombiePopulation=" + pop +
+                      ", DifficultyType=" + difficulty + ", ThemeType=" + theme);
+
+            if (!opts.SeedExplicit) opts.Seed = Convert.ToInt32(seed, CultureInfo.InvariantCulture);
+            if (!opts.NCellsExplicit) opts.NCells = Convert.ToInt32(ncells, CultureInfo.InvariantCulture);
+            if (!opts.DurationExplicit) opts.Duration = Convert.ToSingle(duration, CultureInfo.InvariantCulture);
+            if (!opts.PopExplicit) opts.Pop = Convert.ToSingle(pop, CultureInfo.InvariantCulture);
+            if (!opts.DifficultyExplicit) opts.Difficulty = difficulty.ToString();
+            if (!opts.ThemeExplicit) opts.Theme = theme.ToString();
+
+            Log.Write("SAVE EXTRACT: effective params after explicit-flag overrides -> Seed=" + opts.Seed +
+                      ", NCells=" + opts.NCells + ", Duration=" + opts.Duration.ToString(CultureInfo.InvariantCulture) +
+                      ", Pop=" + opts.Pop.ToString(CultureInfo.InvariantCulture) +
+                      ", Difficulty=" + (opts.Difficulty == null ? "<default>" : opts.Difficulty) +
+                      ", Theme=" + (opts.Theme == null ? "<default None>" : opts.Theme));
+        }
+
+        private static object ReadRequiredParam(object p, string name)
+        {
+            PropertyInfo prop = refl.ParamsType.GetProperty(name);
+            if (prop == null)
+                throw new Day0GenException("save: ZXRandomLevelParams." + name + " property not found.");
+            object value = prop.GetValue(p, null);
+            if (value == null)
+                throw new Day0GenException("save: ZXRandomLevelParams." + name + " is null in the source save.");
+            return value;
+        }
+
+        // Validates a user-supplied enum name (case-insensitive) against the runtime
+        // enum type and returns the parsed value; an unknown name aborts with the
+        // valid list instead of silently generating with a wrong/default value.
+        private static object ParseEnumOrAbort(Type enumType, string value, string what)
+        {
+            string[] names = Enum.GetNames(enumType);
+            foreach (string n in names)
+            {
+                if (string.Compare(n, value, StringComparison.OrdinalIgnoreCase) == 0)
+                    return Enum.Parse(enumType, n, false);
+            }
+            throw new Day0GenException(what + ": '" + value + "' is not a valid " + enumType.Name +
+                                       " value. Valid names: " + string.Join(", ", names) + ".");
         }
 
         // ---------------------------------------------------------------------
@@ -4226,6 +4379,10 @@ namespace Day0Gen
             refl.DiscoverAll(false);
             ZombieInit();               // includes account gate + passive engine-readiness wait
             ProbePasswordMachinery();
+            // save mode's source-save read happens later, inside the paused-engine
+            // envelope (see CreateGameStateAndLevel): deserializing a foreign
+            // ZXGameState during engine startup races the start-screen scene load and
+            // NREs the loading-screen render (DXProjectImage.get_ImageArea).
 
             // resolve effective saves dir again now that the engine can tell us
             string effectiveSavesDir = Path.GetFullPath(EffectiveSavesDir());
@@ -4434,7 +4591,7 @@ namespace Day0Gen
                     throw new Day0GenException("zxcheck mismatch: file contains '" + written + "', signer produced '" + sig + "'.");
                 Log.Write("zxcheck verified: " + sig);
 
-                object readBack = ReadBackState(target);
+                object readBack = ReadGameStateFromSave(target);
                 if (readBack == null)
                     throw new Day0GenException("Read-back of saved state returned null.");
                 object readName = refl.GetProp("read-back.Name", refl.GameStateType.GetProperty("Name"), readBack);
@@ -4493,6 +4650,14 @@ namespace Day0Gen
                 // ---- construction: mirror CC handler minus challenge lines ------------
                 // The dialog has already paused the game, disposed the live menu game
                 // system and set IsLoading; this is the create delegate body.
+                // save mode: derive the six generation params from the source save HERE
+                // and not during engine startup. Reading a foreign ZXGameState while the
+                // start screen is still loading corrupts the scene machine and the
+                // loading-screen render throws NRE (DXProjectImage.get_ImageArea); the
+                // envelope has already settled and paused the engine by this point.
+                // Explicit CLI flags win over the save-derived values.
+                if (opts.Command == "save")
+                    ApplySaveParams();
                 Log.Write("Constructing game state (name='" + opts.Name + "') ...");
                 object gs = refl.Invoke("new ZXGameState(name)", refl.GameStateCtorName, null, opts.Name);
                 refl.Invoke("ZXGameState.Set(gs)", refl.GameStateSetMethod, null, gs);
@@ -4506,9 +4671,15 @@ namespace Day0Gen
                 refl.SetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p, opts.Duration);
                 refl.SetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p, opts.Pop);
                 refl.SetProp("params.Name", refl.ParamsType.GetProperty("Name"), p, opts.Name);
-                refl.SetProp("params.ThemeType=None", refl.ParamsType.GetProperty("ThemeType"), p,
-                             Enum.Parse(refl.MapThemeEnum, "None"));
-                // DifficultyType: intentionally left at default (None) - CC handler parity.
+                object themeValue = opts.Theme == null
+                    ? Enum.Parse(refl.MapThemeEnum, "None")
+                    : ParseEnumOrAbort(refl.MapThemeEnum, opts.Theme, "--theme");
+                refl.SetProp("params.ThemeType=" + themeValue, refl.ParamsType.GetProperty("ThemeType"), p, themeValue);
+                if (opts.Difficulty != null)
+                    refl.SetProp("params.DifficultyType=" + opts.Difficulty,
+                                 refl.ParamsType.GetProperty("DifficultyType"), p,
+                                 ParseEnumOrAbort(refl.DifficultyEnum, opts.Difficulty, "--difficulty"));
+                // DifficultyType otherwise intentionally left at default (None) - CC handler parity.
                 // ChallengeType: intentionally left Default - never CommunityChallenge.
 
                 refl.SetProp("gs.SurvivalModeParams", refl.GameStateType.GetProperty("SurvivalModeParams"), gs, p);
@@ -5927,10 +6098,11 @@ namespace Day0Gen
             return "Count=" + n + ", CommandCenter=" + cc;
         }
 
-        private static object ReadBackState(string target)
+        private static object ReadGameStateFromSave(string target)
         {
             // Replicates the game's load path: flag(path) -> set password -> read
-            // "Data" entry -> clear. Read-only.
+            // "Data" entry -> clear. Read-only; used both for post-save read-back
+            // and for save-mode param extraction.
             object flagObj = refl.Invoke("password flag(target)", refl.FlagMethod, null, target);
             int flag = (int)flagObj;
             refl.Invoke("password generator(set,read)", refl.PwdSetMethod, null, target, flag, true);

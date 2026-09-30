@@ -1,13 +1,13 @@
-# Day0Gen — TAB day-0 map replay (They Are Billions on target-host)
+# Day0Gen — TAB day-0 map replay (They Are Billions)
 
 Regenerate a day-0 **survival** save for the weekly Community Challenge seed
 (`550040233`) without touching the CC save/leaderboard. See `PLAN.md` (mechanics,
 dead ends) and `SPEC.md` (implementation contract). Tool: `src/Day0Gen.cs`
 (single-file C#5 / net48, reflection-only). Built exe: `src/bin/Release/net48/Day0Gen.exe`.
 
-## Target box / paths (target-host, user)
+## Target box / paths
 
-- SSH: `ssh user@target-host` → PowerShell (not cmd). See `code/.serena/memories/target-host/system.md`.
+- Remote shell is PowerShell (not cmd).
 - TAB install: `C:\Program Files (x86)\Steam\steamapps\common\They Are Billions`
 - Saves / root: `%USERPROFILE%\Documents\My Games\They Are Billions\` (`Saves\`, `Account.zxuser`, `ZXLog.txt`)
 - Deployed `Day0Gen.exe` (+ `.config`, `Day0Gen.log`) sits in the TAB dir. Local and
@@ -28,7 +28,7 @@ DXVision-derived). The manager class (`get_GameAccount` owner) is among the fail
 Resolver source in decompile: `vendor/decompiled/--qfkZ-KkimwzG_5GjOFAkJH7Cbg6LrXJCCJODXq7ULSO4-.cs`
 (`AppDomain.CurrentDomain.AssemblyResolve += …`, registered by `_0023_003DzX6exa18_003D()`).
 
-### Fix (verified on target-host via PowerShell)
+### Fix (verified via PowerShell on the target host)
 
 After loading the assembly, run its module constructor **before** `GetTypes()` and before
 `Assembly.Load("DXVision")`:
@@ -53,7 +53,7 @@ The real DXVision assembly must be loaded (via the resolver) and used.
 
 - DONE: `RunModuleConstructor` fix implemented, local `make build` + `make audit` clean, exe
   redeployed to the TAB dir (remote hash verified). Committed as `bc0b8f4`.
-- DONE (P0): `--phase discovery` **completes** on target-host — all SPEC reflection targets found.
+- DONE (P0): `--phase discovery` **completes** on the target host — all SPEC reflection targets found.
 - DONE (P1): `--phase zombie --validate-signer "…\Saves\COMMUNITY CHALLENGE.zxsav"` **passes**.
   Manager singleton ready; `GameAccount` readable; theme table initially threw
   `ZXExceptionGameDataFilesCorrupted` but the engine table loader fixed it (6 themes on retry);
@@ -322,9 +322,8 @@ factors 1.0) with Name fixed to "probe".
 
 ## Project memory / tooling
 
-- SSH: `ssh user@target-host` (PowerShell) or `user@target-host` over tailnet when mDNS is down. scp is
-  broken over it (PowerShell parses the `(x86)` path); transfer files with a base64 pipe +
-  `[IO.File]::WriteAllBytes`.
+- Access is over SSH to a PowerShell shell. `scp` breaks on the `(x86)` install path; transfer
+  files with a base64 pipe + `[IO.File]::WriteAllBytes`.
 - Running the engine in-process (`ZX.Program.Main`) must use `new string[] { "" }` (TABSAT parity),
   NOT real args — real args cause a Steam handoff + process exit. Interactive runs (a `.bat` on the
   user's desktop, `run-day0-full.bat`) behave differently from SSH session-0 runs.
@@ -361,7 +360,7 @@ All blocking + recommended findings from the adversarial review implemented in `
   own artifacts (Day0Gen.exe/.exe.config/.pdb/.log/-watchdog.log, run-day0-*.bat) — any other
   engine write there aborts the run. Steam userdata subtree still NOT covered.
 
-## Code-review fixes (notes/code-review-2.md) — deployed, discovery VERIFIED on target-host
+## Code-review fixes (notes/code-review-2.md) — deployed, discovery VERIFIED on the target host
 
 Blocking C1/C2/C3 from the second adversarial review implemented in `src/Day0Gen.cs`.
 Deployed exe sha256 `76453345F14A4C4D565A1EB0E930737E24BD199A616184B7BC11475732D9E1BC`
@@ -385,7 +384,7 @@ Deployed exe sha256 `76453345F14A4C4D565A1EB0E930737E24BD199A616184B7BC11475732D
   existing message if still null. WHY comment added: OnLoad disposes the live survival/CC menu
   system + other singletons, so it must run on demand only. Adopt guard and all other logic unchanged.
 
-VERIFIED on target-host (2026-09-29 19:39, `--phase discovery`, exit 0):
+VERIFIED on the target host (2026-09-29 19:39, `--phase discovery`, exit 0):
 `FOG NAME TRY: TheyAreBillions.GetType("#=zJme8KFhmikprnkg_2CDeiQE=") -> #=zJme8KFhmikprnkg_2CDeiQE=`
 followed by `FOUND [exact-name] fog system type` and `PHASE discovery COMPLETE`. This confirms the
 C1 decode (the `_2CDe` is literal; the type IS in TheyAreBillions/TabAssembly) and that the old
@@ -648,3 +647,62 @@ the tool snapshots the generated level's own entities, filters to `CSalvable`, r
 overwrites `LevelEntities`/`LevelFastSerializedEntities`, then calls the native writer directly;
 (3) filtering to `CSalvable` excludes terrain (`Cliff` etc., which the game regenerates from the map
 layers) - including them double-created terrain and crashed on `Cliff.OnSceneAdded`.
+
+## Universal CLI (subcommands seed/save + diagnostics) - build+audit clean; later deployed and live-tested (see save-mode fix below)
+
+`src/Day0Gen.cs` only. Adds a friendly subcommand CLI on top of the verified generation path:
+`seed`, `save`, plus the unchanged diagnostics `discovery`/`zombie`/`genprobe`. `--phase full` is
+kept as a backward-compatible alias for `seed`; `--phase discovery|zombie|genprobe` unchanged.
+
+- `Options` gained `Command` (resolved from `args[0]` when it is not a `--flag`, else from
+  `--phase`; `full` folds to `seed`), `FromSave`, `Difficulty`/`Theme` (enum-name strings),
+  `Override*` (Seed/NCells/Duration/Pop/Difficulty/Theme) markers, and a per-command default
+  `Name` (seed -> `Day0 <seed>`, save -> `<sourceBaseName> (Day0)`, diagnostics -> `Day0`).
+  `seed` requires `--seed` unless the legacy `--phase full` form (keeps default 550040233).
+  `save` requires `--from` and the file must exist (checked in Parse).
+- `save` param extraction: `RunFull` calls new `ApplySaveParams()` after engine init +
+  `ProbePasswordMachinery()` and BEFORE construction/generation. It reuses the renamed
+  `ReadGameStateFromSave(path)` (former `ReadBackState`, same verified flag->set password->ZIP
+  "Data" read->clear path), gets `ZXGameState.SurvivalModeParams`, and reflectively reads the six
+  properties. Missing/null `SurvivalModeParams` or any missing/null member aborts with a named
+  `Day0GenException` (fail closed). Extracted values are logged before and after overrides.
+  Explicit `--seed/--ncells/--duration/--pop/--difficulty/--theme` override the save-derived value.
+- Difficulty/theme: `refl.DifficultyEnum` is discovered in `DiscoverAll` from
+  `ZXRandomLevelParams.DifficultyType.PropertyType` (never hardcoded; aborts if not an enum).
+  `CreateGameStateAndLevel` sets `ThemeType` to `None` when `opts.Theme` is null (today's behavior)
+  and parses `opts.Theme`/`opts.Difficulty` via new `ParseEnumOrAbort` (case-insensitive, invalid
+  names abort listing `Enum.GetNames`). `DifficultyType` is untouched unless `--difficulty` is set.
+- UNCHANGED verified path: envelope, `BuildPreSaveEntitySnapshot`, CSalvable filter, `PreSave` +
+  native writer, snapshot allow-list, all diagnostics phases. Only the argument surface, the
+  pre-generation param resolution, and the two enum setters changed.
+- Verification: `make build` 0 warnings/0 errors; `make audit` clean. Options.Parse exercised by a
+  throwaway net8 harness (17 cases: legacy/seed/save/diagnostics defaults + error paths) - ALL PASS.
+  NOT verified live: engine-side save-mode read of a real `.zxsav` (tool not run per task), and the
+  in-game effect of a non-default difficulty/theme. Extraction placement (after ProbePasswordMachinery)
+  chosen so the read uses the already-verified password machinery; not before `ZombieInit`.
+
+## save-mode crash: source-save read must happen after the start screen settles (FIXED/VERIFIED 2026-09-30)
+
+`save` crashed the in-process engine on every attempt: ZXLog showed `ShowStartScreen -> fade ->
+ShowLoadScreen -> 5x ZipSerializer.Deserialize "Zip File Corrupted" (blank filename) -> unhandled
+NRE at DXVision.DXProjectImage.get_ImageArea()` on the render thread; the process died inside
+`WaitForStartScreenSettled` and no save was written. `seed`/legacy `--phase full` crashed the same
+way only when run back-to-back with a lingering engine (Windows WER showed TheyAreBillions.exe
+AppHang + a system-wide crash burst at 10:55); a clean `seed` run succeeds.
+
+Root cause: `ApplySaveParams()` ran in `RunFull` before `WaitForProjectContext`, so
+`ZipSerializer.Read(source,"Data")` deserialized a foreign `ZXGameState` while the engine was
+still loading the start screen. That races the scene machine and corrupts the loading-screen
+render. `seed`/`full` never read a save before the start screen (their only such read is the
+post-save read-back, with the engine paused).
+
+Fix: moved `if (opts.Command == "save") ApplySaveParams();` into `CreateGameStateAndLevel()` (the
+envelope's create delegate) directly before construction - i.e. after `WaitForStartScreenSettled`
+and with the engine paused. Error handling unchanged: the delegate rethrows, the envelope signals
+the main thread, and the run aborts fail-closed.
+
+VERIFIED: `run-day0-save.bat` -> `STARTSCREEN GATE` then `SAVE EXTRACT` inside the envelope ->
+`PHASE full COMPLETE`; `Read-back LevelEntities count=40, commandCenterPresent=True`; ZXLog clean
+(no exception, no ZipSerializer errors). `seed` verified the same day. Deployed exe sha256
+`eee96254f86578751ab5763dc62d760ffc36c28965c48794dc19c8e6ee384e3d` (previous exe kept as a
+backup on the target host).
