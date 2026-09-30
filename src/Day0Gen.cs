@@ -1479,6 +1479,12 @@ namespace Day0Gen
         private static ManualResetEvent dialogCreateDone, dialogSaveDone;
         private static Exception dialogCreateException, dialogSaveException;
 
+        // Expected values captured on the save Task, verified on the main thread after
+        // dialogSaveDone. Written before the event is set, read after WaitOne.
+        private static volatile int expectedLevelEventCount;
+        private static volatile int expectedSpawnGateCount;
+        private static volatile int expectedVillageNestCount;
+
         // Fail-closed ceiling for the start-game envelope's create+saveAfter; the 15-min
         // RunWithWatchdog is the outer backstop.
         private const int DialogCompletionTimeoutMs = 600000;
@@ -4605,6 +4611,8 @@ namespace Day0Gen
                 AssertReadBackHasCommandCenter(readBack);
                 AssertReadBackHasLevelEvents(readBack);
                 LogReadBackEntityHistogram(readBack);
+                AssertReadBackHasSpawnGates(readBack);
+                AssertReadBackHasVillageNests(readBack);
 
                 object list = refl.Invoke("manager save list", refl.SaveListMethod, managerInstance);
                 bool listed = false;
@@ -4808,7 +4816,18 @@ namespace Day0Gen
                 // ZXLevelState.Current.LevelEvents.AddRange(ZXLevelExtension.Current.LevelEvents)).
                 // Day0Gen saves before that lifecycle runs, so without this the wave
                 // schedule would serialize empty and the save would load with no swarms.
-                TransferLevelEventsIntoLevelState(ls, level);
+                // On LOAD the engine takes the AVyu=true branch and SKIPS that AddRange
+                // (game system _0023_003DzwK_pUIeRBpbp line 3106; AVyu set by the load
+                // helper --z4Rev...cs:2488), so the copied events are not duplicated.
+                expectedLevelEventCount = TransferLevelEventsIntoLevelState(ls, level);
+                expectedSpawnGateCount = CountSpawnGatesInLevel(level);
+                int gatesInExtras = CountSpawnGatesInExtraEntities(level);
+                Log.Write("SPAWN GATES (pre-save): " + expectedSpawnGateCount + " in level.Entities, " +
+                          gatesInExtras + " in Extension.MapDrawer.ExtraEntities (CUnitGenerator entities).");
+                expectedVillageNestCount = CountVillageNestsInLevel(level);
+                int nestsInExtras = CountVillageNestsInExtraEntities(level);
+                Log.Write("VILLAGE NESTS (pre-save): " + expectedVillageNestCount + " in level.Entities, " +
+                          nestsInExtras + " in Extension.MapDrawer.ExtraEntities (CInfectionNest entities).");
 
                 // Diagnostic-only (never aborts): locate the Command Center before PreSave.
                 LogCommandCenterDiagnostics(level);
@@ -5093,8 +5112,15 @@ namespace Day0Gen
                       ", dead/unbuilt dropped=" + deadDropped + "), fast-serialized entities=" + fastCount +
                       " in " + fastByTemplate.Count + " template group(s)" +
                       (fastOmitted > 0 ? ", OMITTED=" + fastOmitted : "") + ".");
-            Log.Write("SAVE SNAPSHOT TYPES (LevelEntities): " + EntityTypeHistogram(levelById.Values));
-            Log.Write("SAVE SNAPSHOT TYPES (fast templates): " + FastTemplateHistogram(fastByTemplate));
+            try
+            {
+                Log.Write("SAVE SNAPSHOT TYPES (LevelEntities): " + EntityTypeHistogram(levelById.Values));
+                Log.Write("SAVE SNAPSHOT TYPES (fast templates): " + FastTemplateHistogram(fastByTemplate));
+            }
+            catch (Exception ex)
+            {
+                Log.Write("SAVE SNAPSHOT TYPES (skipped: " + DescribeException(ex) + ")");
+            }
             return snapshot;
         }
 
@@ -5931,7 +5957,7 @@ namespace Day0Gen
         // ZXLevelState.LevelEvents (the engine does this in its level-start lifecycle,
         // which Day0Gen does not run). Idempotent: events already present by reference
         // are not added twice. Fail-closed: a map with no wave schedule aborts the save.
-        private static void TransferLevelEventsIntoLevelState(object ls, object level)
+        private static int TransferLevelEventsIntoLevelState(object ls, object level)
         {
             PropertyInfo stateEventsProp = FindPropertyUp(refl.LevelStateType, "LevelEvents");
             if (stateEventsProp == null)
@@ -5976,6 +6002,7 @@ namespace Day0Gen
             if (extCount == 0)
                 throw new Day0GenException("LEVEL EVENTS: ZXLevelExtension has no LevelEvents - the generated map " +
                     "carries no wave schedule (aborting: the save would have no swarms)");
+            return stateEvents.Count;
         }
 
         // Fail-closed read-back check: a survival save with no LevelEvents loads with no
@@ -6000,10 +6027,92 @@ namespace Day0Gen
                 System.Collections.IEnumerable en = events as System.Collections.IEnumerable;
                 if (en != null) { foreach (object o in en) count++; }
             }
-            Log.Write("Read-back LevelEvents count=" + count + ".");
+            Log.Write("Read-back LevelEvents count=" + count + " (expected " + expectedLevelEventCount + ").");
+            int expectedEvents = expectedLevelEventCount;
+            if (expectedEvents > 0 && count != expectedEvents)
+                throw new Day0GenException("saved LevelEvents count=" + count + " != transferred count=" +
+                    expectedEvents + " - the wave schedule did not serialize intact");
             if (events == null || count == 0)
                 throw new Day0GenException("saved LevelEvents is empty (count=" + count +
                     ") - the save would load without zombie waves");
+        }
+
+        // Diagnostic-only (never aborts): counts entities carrying the named component
+        // type in a collection. Returns -1 when the collection/type is unresolved.
+        private static int CountEntitiesWithComponentIn(System.Collections.IEnumerable entities, string componentTypeName)
+        {
+            if (entities == null) return -1;
+            try
+            {
+                Type comp = FindTypeAnyOrder(componentTypeName, refl.TabAssembly);
+                Type dxEntityType = FindTypeAnyOrder("DXVision.DXEntity", refl.DxAssembly);
+                if (comp == null || dxEntityType == null) return -1;
+                MethodInfo hasDef = FindGenericBoolMethodUp(dxEntityType, "HasComponent", 0);
+                if (hasDef == null) return -1;
+                MethodInfo has;
+                try { has = hasDef.MakeGenericMethod(comp); }
+                catch { return -1; }
+                int n = 0;
+                foreach (object e in entities)
+                {
+                    if (e == null) continue;
+                    try { object r = has.Invoke(e, null); if (r is bool && (bool)r) n++; }
+                    catch { }
+                }
+                return n;
+            }
+            catch { return -1; }
+        }
+
+        private static int CountSpawnGatesIn(System.Collections.IEnumerable entities)
+        {
+            return CountEntitiesWithComponentIn(entities, "ZX.Components.CUnitGenerator");
+        }
+
+        // Gates in a level's own Entities list (where UpdateLevel() puts them).
+        private static int CountSpawnGatesInLevel(object level)
+        {
+            try { return CountSpawnGatesIn(ReadMemberValue(level, "Entities") as System.Collections.IEnumerable); }
+            catch { return -1; }
+        }
+
+        // Gates still present in Extension.MapDrawer.ExtraEntities (PreSave strips the
+        // CSalvable ones, so this is expected to drop to 0 by read-back time).
+        private static int CountSpawnGatesInExtraEntities(object level)
+        {
+            try
+            {
+                object ext = ReadMemberValue(level, "Extension");
+                if (ext == null) return -1;
+                object drawer = ReadMemberValue(ext, "MapDrawer");
+                if (drawer == null) return -1;
+                return CountSpawnGatesIn(ReadMemberValue(drawer, "ExtraEntities") as System.Collections.IEnumerable);
+            }
+            catch { return -1; }
+        }
+
+        // Doom-village nests in a level's own Entities list.
+        private static int CountVillageNestsInLevel(object level)
+        {
+            try { return CountEntitiesWithComponentIn(ReadMemberValue(level, "Entities") as System.Collections.IEnumerable, "ZX.Components.CInfectionNest"); }
+            catch { return -1; }
+        }
+
+        // Doom-village nests still in Extension.MapDrawer.ExtraEntities. PreSave removes
+        // only the CSalvable ones, so the non-CSalvable village buildings remain here and
+        // ride the serialized CurrentGeneratedLevel.
+        private static int CountVillageNestsInExtraEntities(object level)
+        {
+            try
+            {
+                object ext = ReadMemberValue(level, "Extension");
+                if (ext == null) return -1;
+                object drawer = ReadMemberValue(ext, "MapDrawer");
+                if (drawer == null) return -1;
+                return CountEntitiesWithComponentIn(ReadMemberValue(drawer, "ExtraEntities") as System.Collections.IEnumerable,
+                                                    "ZX.Components.CInfectionNest");
+            }
+            catch { return -1; }
         }
 
         // Best-effort histogram of runtime type names for a collection of entities.
@@ -6019,7 +6128,6 @@ namespace Day0Gen
                 total++;
                 if (o == null) continue;
                 string n = o.GetType().Name;
-                if (n == null) n = "?";
                 int c;
                 counts.TryGetValue(n, out c);
                 counts[n] = c + 1;
@@ -6039,7 +6147,7 @@ namespace Day0Gen
                 shown++;
                 if (shown >= 30 && list.Count > shown)
                 {
-                    sb.Append(", ...(").Append(list.Count - shown).Append(" more types)");
+                    sb.Append(", ...(").Append(list.Count - shown).Append(" more type(s))");
                     break;
                 }
             }
@@ -6058,9 +6166,10 @@ namespace Day0Gen
             {
                 if (shown > 0) sb.Append(", ");
                 ulong id = 0;
-                try { id = Convert.ToUInt64(ent.Key, CultureInfo.InvariantCulture); }
+                bool keyOk = false;
+                try { id = Convert.ToUInt64(ent.Key, CultureInfo.InvariantCulture); keyOk = true; }
                 catch { }
-                string name = ResolveEntityTemplateName(id);
+                string name = keyOk ? ResolveEntityTemplateName(id) : null;
                 int count = 0;
                 System.Collections.ICollection col = ent.Value as System.Collections.ICollection;
                 if (col != null) count = col.Count;
@@ -6069,8 +6178,14 @@ namespace Day0Gen
                     System.Collections.IList lst = ent.Value as System.Collections.IList;
                     if (lst != null) count = lst.Count;
                 }
-                sb.Append(name != null ? name : ("id:" + id)).Append('=').Append(count);
+                sb.Append(name != null ? name : (keyOk ? ("id:" + id) : ("key:" + DescribeValue(ent.Key))))
+                  .Append('=').Append(count);
                 shown++;
+                if (shown >= 30 && fastByTemplate.Count > shown)
+                {
+                    sb.Append(", ...(").Append(fastByTemplate.Count - shown).Append(" more groups)");
+                    break;
+                }
             }
             sb.Append(" [groups=").Append(fastByTemplate.Count).Append(']');
             return sb.ToString();
@@ -6121,11 +6236,76 @@ namespace Day0Gen
                 object fast = fastProp == null ? null : fastProp.GetValue(readLs, null);
                 Log.Write("Read-back ENTITY TYPES (fast templates): " +
                           FastTemplateHistogram(fast as System.Collections.IDictionary));
+                int gates = CountSpawnGatesIn(vals);
+                Log.Write("Read-back SPAWN GATES: " + (gates < 0 ? "(unresolved)" : gates.ToString()) +
+                          " (pre-save=" + expectedSpawnGateCount + ") in LevelEntities.");
+                int nestsLevel = CountEntitiesWithComponentIn(vals, "ZX.Components.CInfectionNest");
+                PropertyInfo cglProp = FindPropertyUp(refl.LevelStateType, "CurrentGeneratedLevel");
+                object cgl = cglProp == null ? null : cglProp.GetValue(readLs, null);
+                int nestsExtras = cgl == null ? -1 : CountVillageNestsInExtraEntities(cgl);
+                Log.Write("Read-back VILLAGE NESTS: " + nestsLevel + " in LevelEntities, " + nestsExtras +
+                          " in CurrentGeneratedLevel.Extension.MapDrawer.ExtraEntities (pre-save=" +
+                          expectedVillageNestCount + ").");
             }
             catch (Exception ex)
             {
                 Log.Write("Read-back ENTITY TYPES (skipped: " + DescribeException(ex) + ")");
             }
+        }
+
+        // Fail-closed: at wave time the game spawns zombies only from gates resolved via
+        // DXGame.ComponentsOfType<CUnitGenerator>(); if the saved LevelEntities lost them,
+        // the save would load, count down, and spawn nothing. Only asserted when the
+        // pre-save level actually had gates (survival always does).
+        private static void AssertReadBackHasSpawnGates(object readBack)
+        {
+            int expected = expectedSpawnGateCount;
+            if (expected <= 0) return;
+            PropertyInfo lsProp = FindPropertyUp(refl.GameStateType, "LevelState");
+            object readLs = lsProp == null ? null : lsProp.GetValue(readBack, null);
+            if (readLs == null)
+                throw new Day0GenException("Read-back spawn-gate check: saved LevelState is null");
+            PropertyInfo entsProp = FindPropertyUp(refl.LevelStateType, "LevelEntities");
+            object ents = entsProp == null ? null : entsProp.GetValue(readLs, null);
+            System.Collections.IDictionary dict = ents as System.Collections.IDictionary;
+            System.Collections.IEnumerable vals = dict != null ? (System.Collections.IEnumerable)dict.Values : null;
+            int gates = CountSpawnGatesIn(vals);
+            if (gates != expected)
+                throw new Day0GenException("saved LevelEntities carries " + gates +
+                    " CUnitGenerator spawn gate(s), expected " + expected +
+                    " - the save would load but waves would spawn nothing");
+        }
+
+        // Fail-closed: doom villages are the map's infected cities. If the generated map
+        // had them (pre-save level.Entities) but the saved bytes lost them, the loaded map
+        // would be missing them. Pre-save nests are counted in level.Entities; after PreSave
+        // the CSalvable ones live in LevelState.LevelEntities and the rest remain in
+        // CurrentGeneratedLevel.Extension.MapDrawer.ExtraEntities, so the read-back total is
+        // their sum. Only asserted when the pre-save level actually had villages.
+        private static void AssertReadBackHasVillageNests(object readBack)
+        {
+            int expected = expectedVillageNestCount;
+            if (expected <= 0) return;
+            PropertyInfo lsProp = FindPropertyUp(refl.GameStateType, "LevelState");
+            object readLs = lsProp == null ? null : lsProp.GetValue(readBack, null);
+            if (readLs == null)
+                throw new Day0GenException("Read-back village check: saved LevelState is null");
+            PropertyInfo entsProp = FindPropertyUp(refl.LevelStateType, "LevelEntities");
+            object ents = entsProp == null ? null : entsProp.GetValue(readLs, null);
+            System.Collections.IDictionary dict = ents as System.Collections.IDictionary;
+            System.Collections.IEnumerable vals = dict != null ? (System.Collections.IEnumerable)dict.Values : null;
+            int nestsLevel = CountEntitiesWithComponentIn(vals, "ZX.Components.CInfectionNest");
+            PropertyInfo cglProp = FindPropertyUp(refl.LevelStateType, "CurrentGeneratedLevel");
+            object cgl = cglProp == null ? null : cglProp.GetValue(readLs, null);
+            int nestsExtras = cgl == null ? -1 : CountVillageNestsInExtraEntities(cgl);
+            if (nestsLevel < 0 || nestsExtras < 0)
+                throw new Day0GenException("Read-back village check: could not resolve village nests (LevelEntities=" +
+                    nestsLevel + ", ExtraEntities=" + nestsExtras + ")");
+            int total = nestsLevel + nestsExtras;
+            if (total != expected)
+                throw new Day0GenException("saved village nests = " + total + " (" + nestsLevel +
+                    " LevelEntities + " + nestsExtras + " ExtraEntities), expected " + expected +
+                    " - doom villages would be missing from the loaded map");
         }
 
         // Diagnostics-only (never aborts): each probe is independently guarded - a

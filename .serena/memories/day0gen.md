@@ -707,7 +707,7 @@ VERIFIED: `run-day0-save.bat` -> `STARTSCREEN GATE` then `SAVE EXTRACT` inside t
 `eee96254f86578751ab5763dc62d760ffc36c28965c48794dc19c8e6ee384e3d` (previous exe kept as a
 backup on the target host).
 
-## Fix: empty wave schedule in generated saves (build+audit clean, NOT deployed)
+## Fix: empty wave schedule in generated saves (deployed; countdown live-verified)
 
 `src/Day0Gen.cs` only. Symptom: the generated day-0 `.zxsav` loads but has NO zombie
 waves (swarms) in-game. Root cause: the wave schedule lives in `ZXLevelState.LevelEvents`;
@@ -720,4 +720,28 @@ right after `ReAssertStateBeforeSave` - copies `DXLevel.Extension.LevelEvents` i
 `ZXLevelState.LevelEvents` (idempotent by reference; aborts if the extension has none).
 New fail-closed read-back `AssertReadBackHasLevelEvents(readBack)` (after the CC assertion)
 logs `Read-back LevelEvents count=N` and aborts on 0. New log `LEVEL EVENTS: extension=N,
-added=N, already-present=N, state total=N`. Live re-test pending.
+added=N, already-present=N, state total=N`.
+
+LIVE (verified): `LEVEL EVENTS: extension=6, added=6, already-present=0, state total=6`;
+`Read-back LevelEvents count=6`; the next-wave countdown appears in-game. The 6 events =
+1 win (day 100) + 1 FinalSwarm + 4 periodic waves.
+
+## Hardening from code-critic review of the wave fix (deployed)
+
+- `TransferLevelEventsIntoLevelState` returns the state count; the read-back assertion now
+  requires `count == transferred` (not just `> 0`), so a partially serialized schedule aborts.
+- Spawn gates ARE saved in the snapshot's `LevelEntities` (the 4 `CUnitGenerator` gates
+  render as `DXEntity=4`); `PreSave` strips CSalvable entities out of `ExtraEntities`, so an
+  ExtraEntities-only probe reads 0 (the first live run's `Read-back SPAWN GATES: 0` was that
+  probe artifact, not data loss). Read-back now counts gates in `LevelEntities` and
+  fail-closes (`AssertReadBackHasSpawnGates`, expects the pre-save count, 4).
+- Doom villages: the generator builds each as many `CInfectionNest` buildings added to
+  `MapDrawer.ExtraEntities` (`--zyl_NPjj...cs:289-350`). They are non-CSalvable, so they do
+  NOT appear in the LevelEntities histogram; they ride the serialized `CurrentGeneratedLevel
+  .Extension.MapDrawer.ExtraEntities`. New probes `VILLAGE NESTS (pre-save)` and
+  `Read-back VILLAGE NESTS` + fail-closed `AssertReadBackHasVillageNests` (read-back total =
+  nests in LevelEntities + nests in ExtraEntities must equal the pre-save `level.Entities` count).
+  NOT yet live-confirmed (one run pending).
+- Histogram minors: snapshot histograms guarded; fast-template list capped at 30 groups;
+  unparseable template keys labeled `key:<raw>`; comment notes the LOAD `AVyu=true` branch
+  skips the engine AddRange (no duplicate events on reload).
