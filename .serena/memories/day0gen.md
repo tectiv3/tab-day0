@@ -706,3 +706,18 @@ VERIFIED: `run-day0-save.bat` -> `STARTSCREEN GATE` then `SAVE EXTRACT` inside t
 (no exception, no ZipSerializer errors). `seed` verified the same day. Deployed exe sha256
 `eee96254f86578751ab5763dc62d760ffc36c28965c48794dc19c8e6ee384e3d` (previous exe kept as a
 backup on the target host).
+
+## Fix: empty wave schedule in generated saves (build+audit clean, NOT deployed)
+
+`src/Day0Gen.cs` only. Symptom: the generated day-0 `.zxsav` loads but has NO zombie
+waves (swarms) in-game. Root cause: the wave schedule lives in `ZXLevelState.LevelEvents`;
+the map generator populates `ZXLevelExtension.LevelEvents`, and the engine copies them into
+the serialized state only in its level-start lifecycle (game system `--zxRcpu...cs` ~:3113,
+`_0023_003DzwK_pUIeRBpbp`: `ZXLevelState.Current.LevelEvents.AddRange(ZXLevelExtension.Current.LevelEvents)`).
+Day0Gen's envelope saves before that lifecycle runs, so `LevelEvents` serialized empty.
+Fix: new `TransferLevelEventsIntoLevelState(ls, level)` called in `SaveGeneratedState`
+right after `ReAssertStateBeforeSave` - copies `DXLevel.Extension.LevelEvents` into
+`ZXLevelState.LevelEvents` (idempotent by reference; aborts if the extension has none).
+New fail-closed read-back `AssertReadBackHasLevelEvents(readBack)` (after the CC assertion)
+logs `Read-back LevelEvents count=N` and aborts on 0. New log `LEVEL EVENTS: extension=N,
+added=N, already-present=N, state total=N`. Live re-test pending.

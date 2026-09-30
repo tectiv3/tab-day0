@@ -4603,6 +4603,8 @@ namespace Day0Gen
                 // LevelEntities from the LIVE registry; a missing Command Center there is
                 // silently dropped at write time. Prove it in the saved bytes.
                 AssertReadBackHasCommandCenter(readBack);
+                AssertReadBackHasLevelEvents(readBack);
+                LogReadBackEntityHistogram(readBack);
 
                 object list = refl.Invoke("manager save list", refl.SaveListMethod, managerInstance);
                 bool listed = false;
@@ -4800,6 +4802,13 @@ namespace Day0Gen
                 object level = dialogLevel;
 
                 ReAssertStateBeforeSave(gs, ls, sys);
+
+                // The engine copies the level extension's LevelEvents into the state in
+                // its level-start lifecycle (game system _0023_003DzwK_pUIeRBpbp:
+                // ZXLevelState.Current.LevelEvents.AddRange(ZXLevelExtension.Current.LevelEvents)).
+                // Day0Gen saves before that lifecycle runs, so without this the wave
+                // schedule would serialize empty and the save would load with no swarms.
+                TransferLevelEventsIntoLevelState(ls, level);
 
                 // Diagnostic-only (never aborts): locate the Command Center before PreSave.
                 LogCommandCenterDiagnostics(level);
@@ -5084,6 +5093,8 @@ namespace Day0Gen
                       ", dead/unbuilt dropped=" + deadDropped + "), fast-serialized entities=" + fastCount +
                       " in " + fastByTemplate.Count + " template group(s)" +
                       (fastOmitted > 0 ? ", OMITTED=" + fastOmitted : "") + ".");
+            Log.Write("SAVE SNAPSHOT TYPES (LevelEntities): " + EntityTypeHistogram(levelById.Values));
+            Log.Write("SAVE SNAPSHOT TYPES (fast templates): " + FastTemplateHistogram(fastByTemplate));
             return snapshot;
         }
 
@@ -5914,6 +5925,207 @@ namespace Day0Gen
             if (entities == null || count == 0 || !ccPresent)
                 throw new Day0GenException("saved LevelEntities has no CommandCenter (count=" + count +
                     ", CC found=" + ccPresent + ") - the save would load without a command center");
+        }
+
+        // Copies the generated level extension's wave schedule into the serialized
+        // ZXLevelState.LevelEvents (the engine does this in its level-start lifecycle,
+        // which Day0Gen does not run). Idempotent: events already present by reference
+        // are not added twice. Fail-closed: a map with no wave schedule aborts the save.
+        private static void TransferLevelEventsIntoLevelState(object ls, object level)
+        {
+            PropertyInfo stateEventsProp = FindPropertyUp(refl.LevelStateType, "LevelEvents");
+            if (stateEventsProp == null)
+                throw new Day0GenException("LEVEL EVENTS: ZXLevelState.LevelEvents property not found (build drift?)");
+            object ext = ReadMemberValue(level, "Extension");
+            if (ext == null)
+                throw new Day0GenException("LEVEL EVENTS: DXLevel.Extension is null - cannot read the wave schedule");
+            object extEventsRaw = ReadMemberValue(ext, "LevelEvents");
+            System.Collections.IEnumerable extEvents = extEventsRaw as System.Collections.IEnumerable;
+            if (extEvents == null)
+                throw new Day0GenException("LEVEL EVENTS: ZXLevelExtension.LevelEvents is not IEnumerable (" +
+                                           DescribeValue(extEventsRaw) + ")");
+
+            object stateEventsRaw = stateEventsProp.GetValue(ls, null);
+            System.Collections.IList stateEvents = stateEventsRaw as System.Collections.IList;
+            if (stateEvents == null)
+            {
+                object fresh = Activator.CreateInstance(stateEventsProp.PropertyType);
+                stateEvents = fresh as System.Collections.IList;
+                if (stateEvents == null)
+                    throw new Day0GenException("LEVEL EVENTS: ZXLevelState.LevelEvents type is not IList (" +
+                                               stateEventsProp.PropertyType.FullName + ")");
+                stateEventsProp.SetValue(ls, fresh, null);
+            }
+
+            int extCount = 0, added = 0, present = 0;
+            foreach (object ev in extEvents)
+            {
+                extCount++;
+                if (ev == null) continue;
+                bool already = false;
+                for (int i = 0; i < stateEvents.Count; i++)
+                {
+                    if (object.ReferenceEquals(stateEvents[i], ev)) { already = true; break; }
+                }
+                if (already) { present++; continue; }
+                stateEvents.Add(ev);
+                added++;
+            }
+            Log.Write("LEVEL EVENTS: extension=" + extCount + ", added=" + added +
+                      ", already-present=" + present + ", state total=" + stateEvents.Count + ".");
+            if (extCount == 0)
+                throw new Day0GenException("LEVEL EVENTS: ZXLevelExtension has no LevelEvents - the generated map " +
+                    "carries no wave schedule (aborting: the save would have no swarms)");
+        }
+
+        // Fail-closed read-back check: a survival save with no LevelEvents loads with no
+        // zombie waves, so verify the schedule survived serialization.
+        private static void AssertReadBackHasLevelEvents(object readBack)
+        {
+            PropertyInfo lsProp = FindPropertyUp(refl.GameStateType, "LevelState");
+            if (lsProp == null)
+                throw new Day0GenException("Read-back wave check: ZXGameState.LevelState property not found (build drift?)");
+            object readLs = lsProp.GetValue(readBack, null);
+            if (readLs == null)
+                throw new Day0GenException("saved ZXGameState.LevelState is null - cannot verify the wave schedule");
+            PropertyInfo eventsProp = FindPropertyUp(refl.LevelStateType, "LevelEvents");
+            if (eventsProp == null)
+                throw new Day0GenException("Read-back wave check: ZXLevelState.LevelEvents property not found (build drift?)");
+            object events = eventsProp.GetValue(readLs, null);
+            int count = 0;
+            System.Collections.ICollection col = events as System.Collections.ICollection;
+            if (col != null) count = col.Count;
+            else if (events != null)
+            {
+                System.Collections.IEnumerable en = events as System.Collections.IEnumerable;
+                if (en != null) { foreach (object o in en) count++; }
+            }
+            Log.Write("Read-back LevelEvents count=" + count + ".");
+            if (events == null || count == 0)
+                throw new Day0GenException("saved LevelEvents is empty (count=" + count +
+                    ") - the save would load without zombie waves");
+        }
+
+        // Best-effort histogram of runtime type names for a collection of entities.
+        // Diagnostic only (never aborts): proves which entity types the save carries
+        // (e.g. ZombieMutant / ZombieGiant / CommandCenter).
+        private static string EntityTypeHistogram(System.Collections.IEnumerable entities)
+        {
+            if (entities == null) return "(null)";
+            Dictionary<string, int> counts = new Dictionary<string, int>();
+            int total = 0;
+            foreach (object o in entities)
+            {
+                total++;
+                if (o == null) continue;
+                string n = o.GetType().Name;
+                if (n == null) n = "?";
+                int c;
+                counts.TryGetValue(n, out c);
+                counts[n] = c + 1;
+            }
+            List<KeyValuePair<string, int>> list = new List<KeyValuePair<string, int>>(counts);
+            list.Sort(delegate(KeyValuePair<string, int> a, KeyValuePair<string, int> b)
+            {
+                int d = b.Value.CompareTo(a.Value);
+                return d != 0 ? d : string.CompareOrdinal(a.Key, b.Key);
+            });
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            foreach (KeyValuePair<string, int> kv in list)
+            {
+                if (shown > 0) sb.Append(", ");
+                sb.Append(kv.Key).Append('=').Append(kv.Value);
+                shown++;
+                if (shown >= 30 && list.Count > shown)
+                {
+                    sb.Append(", ...(").Append(list.Count - shown).Append(" more types)");
+                    break;
+                }
+            }
+            sb.Append(" [total=").Append(total).Append(", types=").Append(counts.Count).Append(']');
+            return sb.ToString();
+        }
+
+        // Best-effort histogram of the fast-serialized template groups: template name
+        // (or raw id when the template cannot be resolved) -> entity count.
+        private static string FastTemplateHistogram(System.Collections.IDictionary fastByTemplate)
+        {
+            if (fastByTemplate == null) return "(null)";
+            StringBuilder sb = new StringBuilder();
+            int shown = 0;
+            foreach (System.Collections.DictionaryEntry ent in fastByTemplate)
+            {
+                if (shown > 0) sb.Append(", ");
+                ulong id = 0;
+                try { id = Convert.ToUInt64(ent.Key, CultureInfo.InvariantCulture); }
+                catch { }
+                string name = ResolveEntityTemplateName(id);
+                int count = 0;
+                System.Collections.ICollection col = ent.Value as System.Collections.ICollection;
+                if (col != null) count = col.Count;
+                else
+                {
+                    System.Collections.IList lst = ent.Value as System.Collections.IList;
+                    if (lst != null) count = lst.Count;
+                }
+                sb.Append(name != null ? name : ("id:" + id)).Append('=').Append(count);
+                shown++;
+            }
+            sb.Append(" [groups=").Append(fastByTemplate.Count).Append(']');
+            return sb.ToString();
+        }
+
+        // Resolves an EntityTemplates id -> template Name via DXProject. Best-effort:
+        // any discovery/reflection failure returns null (the caller falls back to the raw id).
+        private static string ResolveEntityTemplateName(ulong templateId)
+        {
+            try
+            {
+                object project = refl.DxProjectFromIdMethod != null
+                    ? refl.DxProjectFromIdMethod.Invoke(null, new object[] { ProjectId })
+                    : ReadDxProjectCurrent();
+                if (project == null) return null;
+                object templatesValue = ReadEntityTemplatesValue(project);
+                System.Collections.IDictionary templates = templatesValue as System.Collections.IDictionary;
+                if (templates == null || !templates.Contains(templateId)) return null;
+                object template = templates[templateId];
+                if (template == null) return null;
+                PropertyInfo np = FindPropertyUp(template.GetType(), "Name");
+                object name = np == null ? null : np.GetValue(template, null);
+                return name as string;
+            }
+            catch { return null; }
+        }
+
+        // Diagnostic-only read-back histogram (never aborts): shows the entity types
+        // actually present in the saved bytes.
+        private static void LogReadBackEntityHistogram(object readBack)
+        {
+            try
+            {
+                PropertyInfo lsProp = FindPropertyUp(refl.GameStateType, "LevelState");
+                object readLs = lsProp == null ? null : lsProp.GetValue(readBack, null);
+                if (readLs == null)
+                {
+                    Log.Write("Read-back ENTITY TYPES: LevelState is null");
+                    return;
+                }
+                PropertyInfo entsProp = FindPropertyUp(refl.LevelStateType, "LevelEntities");
+                object ents = entsProp == null ? null : entsProp.GetValue(readLs, null);
+                System.Collections.IDictionary entsDict = ents as System.Collections.IDictionary;
+                System.Collections.IEnumerable vals = entsDict != null
+                    ? (System.Collections.IEnumerable)entsDict.Values : null;
+                Log.Write("Read-back ENTITY TYPES (LevelEntities): " + EntityTypeHistogram(vals));
+                PropertyInfo fastProp = FindPropertyUp(refl.LevelStateType, "LevelFastSerializedEntities");
+                object fast = fastProp == null ? null : fastProp.GetValue(readLs, null);
+                Log.Write("Read-back ENTITY TYPES (fast templates): " +
+                          FastTemplateHistogram(fast as System.Collections.IDictionary));
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Read-back ENTITY TYPES (skipped: " + DescribeException(ex) + ")");
+            }
         }
 
         // Diagnostics-only (never aborts): each probe is independently guarded - a
