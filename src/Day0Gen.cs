@@ -263,6 +263,7 @@ namespace Day0Gen
         private const string N_PWD_CLEAR = "_0023_003DzvgSfu3ouG_TLllPQAA_003D_003D";
         private const string N_SAVEWRITER = "_0023_003DzMtGuEM2lBSlZ5BGWvg_003D_003D";
         private const string N_SAVE_WRAPPER = "_0023_003DzSV0_oCta8rEv";
+        private const string N_LOADING_DIALOG = "_0023_003Dz9DPDdq9qP9lZ";
         private const string N_SAVES_FOLDER = "_0023_003DzND5ul2zfzAnWdSnC0A_003D_003D";
         private const string N_SAVE_LIST = "_0023_003DzegKkTm3kHc6FhM_EOg_003D_003D";
         private const string N_STATE_INFO = "_0023_003DzHhDw0V62_0024fqG";
@@ -273,6 +274,7 @@ namespace Day0Gen
         private const string N_GAMESYS_TYPE = "_0023_003DzxRcpu6e7NYzT7tGWqPjpOkc_003D";
         private const string N_SET_LEVEL = "_0023_003DzmTU4kueQctVr";
         private const string N_ADOPT_LEVEL = "_0023_003Dzf9PbDap0F6OC";
+        private const string N_PRESAVE = "_0023_003DzQXHqcVh9mGZZ";
         private const string N_TABLE_LOADER_TYPE = "_0023_003Dz3Zxcp6RwVCZHa9xpeg_003D_003D";
         private const string N_TABLE_LOAD = "_0023_003DzUoK3qsRYSJTT";
         private const string N_FOG_SYSTEM_TYPE = "_0023_003DzJme8KFhmikprnkg_2CDeiQE_003D";
@@ -326,6 +328,7 @@ namespace Day0Gen
         public MethodInfo PwdClearMethod;            // static (string,int,bool) -> void
         public MethodInfo SaveWriterMethod;          // instance (string) -> void  [low-level native writer, no pause/PreSave]
         public MethodInfo SaveStateWrapperMethod;    // instance (string, Action, bool, bool) -> void  [game SaveState: pause + PreSave + native writer]
+        public MethodInfo LoadingDialogMethod;       // instance (int, Action, Action, List<string>, bool) -> void  [engine start-game lifecycle: pause + dispose + Task create + finish-frame saveAfter]
         public MethodInfo SavesFolderMethod;         // static () -> string
         public MethodInfo SaveListMethod;            // instance () -> List<ZXGameStateInfo>
 
@@ -353,6 +356,7 @@ namespace Day0Gen
 
         // ZXLevelState
         public MethodInfo AdoptLevelMethod;          // instance (DXLevel) -> void  [level adoption: SetLevel continuation]
+        public MethodInfo PreSaveMethod;             // instance () -> void  [ZXLevelState PreSave: clears entities, rebuilds LevelEntities from the live registry]
 
         // DXVision.Serialization.ZipSerializer
         public PropertyInfo ZipCurrentProp, ZipPasswordProp;
@@ -455,6 +459,21 @@ namespace Day0Gen
         {
             return (m.IsStatic ? "static " : "instance ") +
                    (m.IsPublic ? "public" : (m.IsFamily || m.IsFamilyOrAssembly ? "protected" : "nonpublic"));
+        }
+
+        // C1 strategy: the engine loading dialog signature is the one contract that must
+        // match exactly (notes/loading-dialog-contract.md). Validated before the reflective
+        // invoke so a same-named overflow/overload can never be called with our delegate list.
+        private static bool IsLoadingDialogSignature(MethodInfo m)
+        {
+            if (m.ReturnType != typeof(void)) return false;
+            ParameterInfo[] p = m.GetParameters();
+            return p.Length == 5
+                && p[0].ParameterType == typeof(int)
+                && p[1].ParameterType == typeof(Action)
+                && p[2].ParameterType == typeof(Action)
+                && p[3].ParameterType == typeof(List<string>)
+                && p[4].ParameterType == typeof(bool);
         }
 
         private void Found(string purpose, string strategy, MethodInfo m)
@@ -610,6 +629,35 @@ namespace Day0Gen
             else
                 Log.Write("WARNING: game SaveState wrapper not found by exact name '" + N_SAVE_WRAPPER +
                           "'; the legacy direct-writer fallback (no pause/PreSave) will be used if reached.");
+
+            // C1 strategy (notes/loading-dialog-contract.md): the engine's own manager
+            // loading dialog runs the start-game lifecycle (pause, dispose game system,
+            // Task create, finish-frame saveAfter). Exact escaped name first; a name miss
+            // or signature mismatch falls back to a signature scan on the manager type.
+            // Not fatal here - phase full aborts at the invoke site if it stays null.
+            LoadingDialogMethod = ManagerType.GetMethod(Unescape(N_LOADING_DIALOG),
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (LoadingDialogMethod != null && !IsLoadingDialogSignature(LoadingDialogMethod))
+            {
+                Log.Write("NOTE: manager loading dialog found by exact name '" + N_LOADING_DIALOG +
+                          "' but the (int, Action, Action, List<string>, bool) signature does not match; " +
+                          "scanning by signature ...");
+                LoadingDialogMethod = null;
+            }
+            if (LoadingDialogMethod == null)
+            {
+                foreach (MethodInfo m in ManagerType.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (IsLoadingDialogSignature(m)) { LoadingDialogMethod = m; break; }
+                }
+            }
+            if (LoadingDialogMethod != null)
+                Found("manager loading dialog (int, Action, Action, List<string>, bool) [engine start-game lifecycle]",
+                      "exact-name/signature", LoadingDialogMethod);
+            else
+                Log.Write("WARNING: manager loading dialog not found by exact name '" + N_LOADING_DIALOG +
+                          "' or by 5-arg signature; phase full will abort.");
 
             SavesFolderMethod = ManagerType.GetMethod(Unescape(N_SAVES_FOLDER),
                 BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
@@ -793,6 +841,36 @@ namespace Day0Gen
                 throw new Day0GenException("Level adoption method " + N_ADOPT_LEVEL +
                                            "(DXLevel) not found on ZXLevelState");
             Found("ZXLevelState adopt level (SetLevel continuation)", "exact-name", AdoptLevelMethod);
+
+            // PreSave clears the generated level's Entities + CSalvable ExtraEntities and
+            // rebuilds LevelEntities from the LIVE component registry, which the tolerated
+            // scene-object NRE leaves EMPTY. The save path snapshots the generated level
+            // first, invokes this explicitly, then overwrites the rebuilt dictionaries
+            // before the native writer runs (see SaveGeneratedState).
+            PreSaveMethod = null;
+            for (Type cur = LevelStateType; cur != null && PreSaveMethod == null; cur = cur.BaseType)
+            {
+                MethodInfo[] presaveMethods = null;
+                try
+                {
+                    presaveMethods = cur.GetMethods(BindingFlags.Instance | BindingFlags.Public |
+                                                    BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (presaveMethods == null) continue;
+                foreach (MethodInfo m in presaveMethods)
+                {
+                    if (m.Name == Unescape(N_PRESAVE) && m.GetParameters().Length == 0 &&
+                        m.ReturnType == typeof(void))
+                    { PreSaveMethod = m; break; }
+                }
+            }
+            if (PreSaveMethod != null)
+                Found("ZXLevelState PreSave " + N_PRESAVE + "() [clears entities; rebuilds LevelEntities]",
+                      "exact-name", PreSaveMethod);
+            else
+                Log.Write("WARNING: ZXLevelState PreSave not found by exact name '" + N_PRESAVE +
+                          "'; the save path aborts (fail closed) if reached.");
 
             // --- Game-system OnLoad + fog system (enter-game transition) ------------
             // The adoption above dereferences DXSystem.Get<fogsys>().LayerFog
@@ -1326,6 +1404,19 @@ namespace Day0Gen
         private static bool uiMarshalUsedFallback;
         private static IntPtr uiMarshalMainWindowHandle;
         private static int uiMarshalFormCount;
+
+        // C1 strategy: state shared between the manager loading dialog's create delegate
+        // (Task thread) and saveAfter delegate (engine finish frame). The ManualResetEvents
+        // publish the writes to the waiting main thread (WaitOne is a full barrier),
+        // which owns all post-save verification and the C4 cleanup/abort.
+        private static object dialogGs, dialogParams, dialogLs, dialogSys, dialogLevel;
+        private static string dialogTarget, dialogCheckPath, dialogSavesDir;
+        private static ManualResetEvent dialogCreateDone, dialogSaveDone;
+        private static Exception dialogCreateException, dialogSaveException;
+
+        // Fail-closed ceiling for the start-game envelope's create+saveAfter; the 15-min
+        // RunWithWatchdog is the outer backstop.
+        private const int DialogCompletionTimeoutMs = 600000;
 
         // Stable id of the game's built-in project. The generator resolves its entity
         // templates through DXProject.FromID(this), so a non-null result is the real
@@ -1936,6 +2027,379 @@ namespace Day0Gen
                                                " has null NumDoomVillages - re-poisoned after rebuild; aborting before generator");
             }
             Log.Write("THEME QUICK RE-VERIFY OK (" + dict.Count + " entr(ies), every NumDoomVillages non-null).");
+        }
+
+        // ---------------------------------------------------------------------
+        // Entity-default-params readiness gate (called immediately before the
+        // generator invoke).
+        //
+        // ZXEntity.#=zthu8vuk=() reads manager.<entityDefaultParams>[Template.Name]
+        // whenever that dictionary is non-empty; CreateInstance runs it for every
+        // entity the generator instantiates. The manager fills the dictionary in
+        // #=zCr_j9C0uHkPXZ$SDGA==, a PostMethods_OnStartFrame action that runs AFTER
+        // CurrentProject = DXProject.LoadFromFile(...). DXProject.FromID becomes
+        // non-null at the LoadFromFile boundary, so WaitForProjectContext can pass
+        // while the dictionary is still filling; invoking the generator then races
+        // the engine and throws KeyNotFoundException inside CreateInstance. This
+        // gate waits for the dictionary to hold every ZXEntity template.
+        //
+        // A discovery failure is fail-open (log + return): the generator still
+        // fails closed on its own if the race actually hits.
+        // ---------------------------------------------------------------------
+        private static void WaitForEntityDefaultParamsGate()
+        {
+            Type edpType;
+            FieldInfo dictField;
+            Type zxEntityType;
+            object templatesValue;
+            object project;
+            int expected;
+            string ccName;
+
+            try
+            {
+                edpType = FindTypeAnyOrder("ZX.ZXEntityDefaultParams", refl.TabAssembly);
+                if (edpType == null)
+                    edpType = FindTypeAnyOrder("ZX.EntityDefaultParams", refl.TabAssembly);
+                if (edpType == null)
+                    edpType = FindTypeByNameSuffix("ZXEntityDefaultParams");
+                if (edpType == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (ZXEntityDefaultParams type not found) - " +
+                              "cannot verify manager entity-default-params readiness");
+                    return;
+                }
+
+                dictField = FindEntityDefaultParamsDictField(refl.ManagerType, edpType);
+                if (dictField == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (manager Dictionary<string,ZXEntityDefaultParams> " +
+                              "instance field not found on " +
+                              (refl.ManagerType == null ? "null" : refl.ManagerType.FullName) + ") - " +
+                              "cannot verify manager entity-default-params readiness");
+                    return;
+                }
+                Log.Write("ENTITY PARAMS GATE: manager dict field '" + dictField.Name + "' : " +
+                          dictField.FieldType.FullName);
+
+                zxEntityType = FindTypeAnyOrder("ZX.Entities.ZXEntity", refl.TabAssembly);
+                if (zxEntityType == null)
+                    zxEntityType = FindTypeByNameSuffix("ZXEntity");
+                if (zxEntityType == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (ZX.Entities.ZXEntity type not found) - " +
+                              "cannot verify manager entity-default-params readiness");
+                    return;
+                }
+
+                if (managerInstance == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (managerInstance is null) - " +
+                              "cannot verify manager entity-default-params readiness");
+                    return;
+                }
+
+                // FromID is populated by LoadFromFile and non-null by now (WaitForProjectContext);
+                // Current is the weaker fallback if FromID was never discovered.
+                if (refl.DxProjectFromIdMethod != null)
+                    project = refl.DxProjectFromIdMethod.Invoke(null, new object[] { ProjectId });
+                else
+                    project = ReadDxProjectCurrent();
+                if (project == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (DXProject.FromID(" + ProjectId + ") returned null) - " +
+                              "cannot verify manager entity-default-params readiness");
+                    return;
+                }
+
+                templatesValue = ReadEntityTemplatesValue(project);
+                if (templatesValue == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (DXProject.EntityTemplates member not found or null on " +
+                              project.GetType().FullName + ") - cannot verify manager entity-default-params readiness");
+                    return;
+                }
+                System.Collections.IDictionary templates = templatesValue as System.Collections.IDictionary;
+                if (templates == null)
+                {
+                    Log.Write("ENTITY PARAMS GATE: skipped (EntityTemplates is not IDictionary: " +
+                              DescribeValue(templatesValue) + ") - cannot verify manager entity-default-params readiness");
+                    return;
+                }
+
+                // Exact expected count: the manager adds one dict entry per
+                // EntityTemplates.Values entry whose Entity is a ZXEntity. The reserved
+                // CommandCenter template name is probed as a secondary key check when
+                // resolvable.
+                expected = 0;
+                foreach (System.Collections.DictionaryEntry ent in templates)
+                {
+                    bool isZxEntity = false;
+                    try
+                    {
+                        object template = ent.Value;
+                        if (template != null)
+                        {
+                            PropertyInfo ep = FindPropertyUp(template.GetType(), "Entity");
+                            object entity = ep == null ? null : ep.GetValue(template, null);
+                            isZxEntity = entity != null && zxEntityType.IsInstanceOfType(entity);
+                        }
+                    }
+                    catch { isZxEntity = false; }
+                    if (isZxEntity) expected++;
+                }
+
+                ccName = null;
+                try
+                {
+                    if (templates.Contains(GenProbeCommandCenterTemplateId))
+                    {
+                        object ccTemplate = templates[GenProbeCommandCenterTemplateId];
+                        if (ccTemplate != null)
+                        {
+                            PropertyInfo np = FindPropertyUp(ccTemplate.GetType(), "Name");
+                            object name = np == null ? null : np.GetValue(ccTemplate, null);
+                            ccName = name as string;
+                        }
+                    }
+                }
+                catch { ccName = null; }
+            }
+            catch (Exception e)
+            {
+                Log.Write("ENTITY PARAMS GATE: skipped (discovery threw: " + DescribeException(e) + ") - " +
+                          "cannot verify manager entity-default-params readiness");
+                return;
+            }
+
+            bool requireCc = !string.IsNullOrEmpty(ccName);
+            Log.Write("ENTITY PARAMS GATE: expected=" + expected + " ZXEntity template(s)" +
+                      (requireCc ? ", CommandCenter template name resolved" : ", CommandCenter template name unresolved") +
+                      " (manager dict '" + dictField.Name + "')");
+
+            // The dict is mutated by the engine thread; wrap EVERY read (Count,
+            // Contains) so a concurrent-mutation exception never aborts the gate.
+            DateTime deadline = DateTime.UtcNow.AddSeconds(120);
+            int polls = 0;
+            int lastCount = -1;
+            bool lastCc = false;
+            bool probeLogged = false;
+            while (DateTime.UtcNow < deadline && !engineThreadDead)
+            {
+                int count = -1;
+                bool ccPresent = !requireCc;
+                try
+                {
+                    object dictObj = dictField.GetValue(managerInstance);
+                    System.Collections.IDictionary d = dictObj as System.Collections.IDictionary;
+                    if (d != null)
+                    {
+                        count = d.Count;
+                        if (requireCc) ccPresent = d.Contains(ccName);
+                    }
+                    else if (!probeLogged)
+                    {
+                        Log.Write("ENTITY PARAMS GATE: manager dict is not IDictionary (" +
+                                  DescribeValue(dictObj) + "); will keep polling");
+                        probeLogged = true;
+                    }
+                }
+                catch (Exception e)
+                {
+                    if (!probeLogged)
+                    {
+                        Log.Write("ENTITY PARAMS GATE: dict probe threw (engine thread still mutating; " +
+                                  "will keep polling): " + DescribeException(e));
+                        probeLogged = true;
+                    }
+                }
+
+                polls++;
+                lastCount = count;
+                lastCc = ccPresent;
+                if (count >= expected && ccPresent)
+                {
+                    Log.Write("ENTITY PARAMS GATE: ready after " + polls + " poll(s): dict count=" + count +
+                              " / expected=" + expected +
+                              (requireCc ? ", CommandCenter key present=true" : "") + ".");
+                    return;
+                }
+                if (polls % 10 == 0)
+                {
+                    Log.Write("ENTITY PARAMS GATE: dict count=" + count + " / expected=" + expected +
+                              " (poll " + polls + ")" +
+                              (requireCc ? ", CommandCenter key present=" + ccPresent.ToString().ToLowerInvariant() : ""));
+                }
+                Thread.Sleep(500);
+            }
+
+            if (engineThreadDead)
+                Log.Write("ENTITY PARAMS GATE: engine thread died while waiting; aborting before generator.");
+            throw new Day0GenException("Entity-default-params gate timed out after 120s: manager dict count=" +
+                                       lastCount + " / expected=" + expected +
+                                       (requireCc ? ", CommandCenter key present=" + lastCc.ToString().ToLowerInvariant() : "") +
+                                       " - the generator would throw KeyNotFoundException in DXEntity.CreateInstance; aborting.");
+        }
+
+        // ---------------------------------------------------------------------
+        // Start-screen settle gate (called immediately before the generator invoke).
+        //
+        // The engine runs its STARTUP fade-to-start-screen transition asynchronously;
+        // its onFinish callback then drives ChangeScene -> ZXSystem_StartScreen -
+        // Load/ShowScene, whose teardown tears down the game level and wipes every
+        // entity. If generation/SetLevel runs while that transition is still pending,
+        // the onFinish fires AFTER the level load and wipes it before the save. This
+        // gate waits for the transition's terminal ZXLog marker so no pending scene
+        // change remains. It is fail-open: the post-save CC assertion is the
+        // fail-closed backstop, so a timeout must never abort. See
+        // notes/missing-command-center.md (start-screen teardown root cause).
+        // ---------------------------------------------------------------------
+        private const string StartScreenSettledMarker = "ZXSystem_StartScreen - ShowSceneSuccess";
+
+        private static void WaitForStartScreenSettled(string savesDir)
+        {
+            DateTime deadline = DateTime.UtcNow.AddSeconds(90);
+            int polls = 0;
+            while (DateTime.UtcNow < deadline)
+            {
+                polls++;
+                // Whole-file scan (offset 0): the engine truncates ZXLog on start
+                // ("Log Start"), and the transition may already have completed during
+                // an earlier readiness wait, so a new-bytes-only scan would miss it.
+                string whole = ReadZxLogPortion(savesDir, 0);
+                if (whole.IndexOf(StartScreenSettledMarker, StringComparison.Ordinal) >= 0)
+                {
+                    Log.Write("STARTSCREEN GATE: engine settled on the start screen after " +
+                              polls + " poll(s).");
+                    return;
+                }
+                if (engineThreadDead)
+                {
+                    Log.Write("STARTSCREEN GATE: engine thread died while waiting; proceeding without " +
+                              "start-screen settle.");
+                    return;
+                }
+                if (polls % 10 == 0)
+                    Log.Write("STARTSCREEN GATE: waiting for '" + StartScreenSettledMarker +
+                              "' (poll " + polls + ")");
+                Thread.Sleep(500);
+            }
+            // Timeout (or unreadable ZXLog, which the read helper reports as empty):
+            // warn and continue - the read-back CC assertion fails closed if the level
+            // was actually wiped.
+            Log.Write("STARTSCREEN GATE: marker not seen after 90s (engine may still be transitioning); " +
+                      "proceeding - the save CC assertion will catch an empty level");
+        }
+
+        // Locates the manager's entity-default-params dictionary: the single instance
+        // field typed Dictionary<string, ZXEntityDefaultParams>. Falls back to matching
+        // any dictionary value type whose simple name ends with ZXEntityDefaultParams so
+        // a name-resolution miss does not hide the field.
+        private static FieldInfo FindEntityDefaultParamsDictField(Type managerType, Type edpType)
+        {
+            if (managerType == null) return null;
+            List<FieldInfo> matches = new List<FieldInfo>();
+            for (Type cur = managerType; cur != null; cur = cur.BaseType)
+            {
+                FieldInfo[] fields;
+                try
+                {
+                    fields = cur.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { break; }
+                foreach (FieldInfo f in fields)
+                {
+                    Type ft;
+                    try { ft = f.FieldType; } catch { continue; }
+                    if (ft == null || !ft.IsGenericType) continue;
+                    try { if (ft.GetGenericTypeDefinition() != typeof(Dictionary<,>)) continue; }
+                    catch { continue; }
+                    Type[] args;
+                    try { args = ft.GetGenericArguments(); } catch { continue; }
+                    if (args == null || args.Length != 2) continue;
+                    bool match = edpType != null && args[1] == edpType;
+                    if (!match)
+                    {
+                        string vn = null;
+                        try { vn = args[1].Name; } catch { }
+                        if (vn != null && vn.EndsWith("ZXEntityDefaultParams", StringComparison.Ordinal))
+                            match = true;
+                    }
+                    if (match) matches.Add(f);
+                }
+            }
+            if (matches.Count != 1)
+            {
+                if (matches.Count > 1)
+                    Log.Write("ENTITY PARAMS GATE: " + matches.Count +
+                              " candidate manager entity-default-params dict fields; discovery ambiguous.");
+                return null;
+            }
+            return matches[0];
+        }
+
+        // Fallback type locator by simple-name suffix across both assemblies; used only
+        // when the exact full name misses. Returns null when not unique so callers can
+        // fail open.
+        private static Type FindTypeByNameSuffix(string simpleNameSuffix)
+        {
+            List<Type> matches = new List<Type>();
+            AddTypeSuffixMatches(GameReflector.SafeGetTypes(refl.TabAssembly), simpleNameSuffix, matches);
+            AddTypeSuffixMatches(GameReflector.SafeGetTypes(refl.DxAssembly), simpleNameSuffix, matches);
+            if (matches.Count >= 2)
+            {
+                List<Type> unique = new List<Type>();
+                foreach (Type m in matches)
+                {
+                    bool seen = false;
+                    foreach (Type u in unique)
+                    {
+                        if (ReferenceEquals(u, m)) { seen = true; break; }
+                    }
+                    if (!seen) unique.Add(m);
+                }
+                matches = unique;
+            }
+            return matches.Count == 1 ? matches[0] : null;
+        }
+
+        private static void AddTypeSuffixMatches(Type[] types, string suffix, List<Type> into)
+        {
+            if (types == null) return;
+            foreach (Type t in types)
+            {
+                if (t == null) continue;
+                string n = null;
+                try { n = t.Name; } catch { }
+                if (n == null || !n.EndsWith(suffix, StringComparison.Ordinal)) continue;
+                bool nested = false;
+                try { nested = t.IsNested; } catch { nested = false; }
+                if (nested) continue;
+                string fn = null;
+                try { fn = t.FullName; } catch { }
+                if (fn != null && (fn.IndexOf("<", StringComparison.Ordinal) >= 0 ||
+                                   fn.IndexOf(">", StringComparison.Ordinal) >= 0)) continue;
+                into.Add(t);
+            }
+        }
+
+        private static object ReadEntityTemplatesValue(object project)
+        {
+            if (project == null) return null;
+            try
+            {
+                Type t = project.GetType();
+                PropertyInfo p = FindPropertyUp(t, "EntityTemplates");
+                if (p != null) return p.GetValue(project, null);
+                FieldInfo f = FindFieldUp(t, "EntityTemplates");
+                if (f != null) return f.GetValue(project);
+            }
+            catch (Exception e)
+            {
+                Log.Write("ENTITY PARAMS GATE: EntityTemplates read threw: " + DescribeException(e));
+            }
+            return null;
         }
 
         // Null-safe property read for verification logging: a missing property or a
@@ -3819,15 +4283,28 @@ namespace Day0Gen
                 // the two artifacts plus the engine's ZXLog.txt in the saves root. A file
                 // merely NAMED like our target in any other (sub)directory is unexpected.
                 string zxLogFull = Path.GetFullPath(ZxLogPath(effectiveSavesDir));
+                // The engine's render-thread NRE writes its own crash pair next to our
+                // target (<stem>_Crash.zxsav/.zxcheck). It is an engine side effect of
+                // running the process, not a change we can prevent; allow exactly those
+                // two derived paths and nothing else (targetSeen/checkSeen stay required).
+                string crashSav = Path.Combine(Path.GetDirectoryName(target),
+                    Path.GetFileNameWithoutExtension(target) + "_Crash" + Path.GetExtension(target));
+                string crashCheck = Path.Combine(Path.GetDirectoryName(target),
+                    Path.GetFileNameWithoutExtension(target) + "_Crash" + Path.GetExtension(checkPath));
                 List<string> unexpected = new List<string>();
                 bool targetSeen = false;
                 bool checkSeen = false;
                 foreach (string c in changes)
                 {
-                    Log.Write("CHANGE: " + c);
                     // change lines use the "<VERB>: <path>" form; ':' cannot occur in
                     // Windows file names so the first ": " cleanly separates
                     string path = c.Substring(c.IndexOf(": ") + 2).Trim();
+                    if (SameFullPath(path, crashSav) || SameFullPath(path, crashCheck))
+                    {
+                        Log.Write("CHANGE (engine crash save, allowed): " + path);
+                        continue;
+                    }
+                    Log.Write("CHANGE: " + c);
                     if (SameFullPath(path, target)) { targetSeen = true; continue; }
                     if (SameFullPath(path, checkPath)) { checkSeen = true; continue; }
                     if (SameFullPath(path, zxLogFull)) continue;
@@ -3873,43 +4350,6 @@ namespace Day0Gen
         // ---------------------------------------------------------------------
         private static void RunConstructGenerateSave(string target, string checkPath, string effectiveSavesDir)
         {
-            // ---- construction: mirror CC handler minus challenge lines ------------
-            Log.Write("Constructing game state (name='" + opts.Name + "') ...");
-            object gs = refl.Invoke("new ZXGameState(name)", refl.GameStateCtorName, null, opts.Name);
-            refl.Invoke("ZXGameState.Set(gs)", refl.GameStateSetMethod, null, gs);
-            refl.SetProp("gs.GameMode=Survival", refl.GameStateType.GetProperty("GameMode"), gs,
-                         Enum.Parse(refl.GameModeEnum, "Survival"));
-
-            object p = refl.CreateInstance("new ZXRandomLevelParams()", refl.ParamsType);
-            Log.Write("Created ZXRandomLevelParams (defaults untouched except below).");
-            refl.SetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p, opts.Seed);
-            refl.SetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p, opts.NCells);
-            refl.SetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p, opts.Duration);
-            refl.SetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p, opts.Pop);
-            refl.SetProp("params.Name", refl.ParamsType.GetProperty("Name"), p, opts.Name);
-            refl.SetProp("params.ThemeType=None", refl.ParamsType.GetProperty("ThemeType"), p,
-                         Enum.Parse(refl.MapThemeEnum, "None"));
-            // DifficultyType: intentionally left at default (None) - CC handler parity.
-            // ChallengeType: intentionally left Default - never CommunityChallenge.
-
-            refl.SetProp("gs.SurvivalModeParams", refl.GameStateType.GetProperty("SurvivalModeParams"), gs, p);
-
-            object ls = refl.CreateInstance("new ZXLevelState()", refl.LevelStateType);
-            refl.Invoke("ZXLevelState.Set(ls)", refl.LevelStateSetMethod, null, ls);
-            refl.Invoke("ZXLevelState.Init()", refl.LevelStateInitMethod, ls);
-
-            object sys = refl.Invoke("DXSystem.Load<gamesystem>(false)",
-                refl.DxSystemLoadMethod.MakeGenericMethod(refl.GameSystemType), null, false);
-            refl.SetProp("manager.CurrentGameSystem=sys", refl.CurrentGameSystemProp, managerInstance, sys);
-
-            Log.Write("Effective ZXRandomLevelParams read back before generation:");
-            refl.GetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p);
-            refl.GetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p);
-            refl.GetProp("params.ThemeType", refl.ParamsType.GetProperty("ThemeType"), p);
-            refl.GetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p);
-            refl.GetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p);
-            refl.GetProp("params.Name", refl.ParamsType.GetProperty("Name"), p);
-
             LogProjectDiagnostics();
 
             // Bracket the engine-side ZXLog output around the generation call so the
@@ -3919,148 +4359,801 @@ namespace Day0Gen
             // seconds of engine scene activity passed since the rebuild; this closes
             // the re-poisoning window to microseconds. Aborts on any poisoned shape.
             ReVerifyThemeTableQuick();
-            Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
-            object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
-            if (level == null)
-                throw new Day0GenException("Generator returned null level.");
+            // Gate on the engine's entity-default-params dict: it is filled by a
+            // PostMethods_OnStartFrame action that runs after FromID becomes non-null,
+            // so a generator invoke here would otherwise race it (KeyNotFoundException
+            // in CreateInstance). See WaitForEntityDefaultParamsGate.
+            WaitForEntityDefaultParamsGate();
+            // The engine's startup fade-to-start-screen transition completes
+            // asynchronously and its onFinish wipes the level; wait for it to settle
+            // before generating/SetLevel so no pending scene change can tear the level
+            // down before the save. See WaitForStartScreenSettled.
+            WaitForStartScreenSettled(effectiveSavesDir);
 
-            // Record the ZXLog byte offset BEFORE SetLevel: its engine-side work
-            // (scene objects, minimap, ChangeScene) logs asynchronously, and the
-            // completion poll below must only look at bytes written after this point.
-            long zxLogOffset = ZxLogLengthBeforeSetLevel(effectiveSavesDir);
+            // STRATEGY CHANGE (notes/code-review-3.md C1/E + notes/loading-dialog-contract.md):
+            // the engine's manager loading dialog owns the correct start-game lifecycle,
+            // but its dispatch is gated on an overlay fade animation (create runs only on
+            // OnFinished) and it drops the delegate when DXGame.Scene == null. The live run
+            // stalled after ChangeScene and create never started. InvokeStartGameEnvelope
+            // replicates the dialog's non-animation envelope DIRECTLY (pause, dispose/nul
+            // the live menu game system, set IsLoading, run create on a Task) and runs the
+            // save on that same Task right after create returns - no frame-queue dependency,
+            // since the engine is paused and the start-frame queue is not draining. The
+            // gates above remain as readiness proof.
+            dialogTarget = target;
+            dialogCheckPath = checkPath;
+            dialogSavesDir = effectiveSavesDir;
+            dialogGs = null;
+            dialogParams = null;
+            dialogLs = null;
+            dialogSys = null;
+            dialogLevel = null;
+            dialogCreateException = null;
+            dialogSaveException = null;
+            dialogCreateDone = new ManualResetEvent(false);
+            dialogSaveDone = new ManualResetEvent(false);
 
-            bool setLevelSwallowed = false;
+            Action createAction = new Action(CreateGameStateAndLevel);
+            Action saveAfterAction = new Action(SaveGeneratedState);
+            InvokeStartGameEnvelope(createAction, saveAfterAction);
+
+            Log.Write("DIALOG: waiting up to " + (DialogCompletionTimeoutMs / 1000) +
+                      "s for the create+save Task to signal ...");
+            if (!dialogSaveDone.WaitOne(DialogCompletionTimeoutMs))
+            {
+                bool createFinished = dialogCreateDone.WaitOne(0);
+                if (dialogCreateException != null)
+                    throw new Day0GenException("Manager loading dialog: create delegate failed, so saveAfter " +
+                        "never ran (fail closed). See DIALOG CREATE in the log.", dialogCreateException);
+                throw new Day0GenException("Manager loading dialog: saveAfter did not complete within " +
+                    (DialogCompletionTimeoutMs / 1000) + "s (create finished=" + createFinished +
+                    ") - the create+save Task likely threw or stalled (fail closed). See ZXLog.");
+            }
+            if (dialogCreateException != null)
+                throw new Day0GenException("Manager loading dialog: create delegate failed (fail closed).",
+                    dialogCreateException);
+            if (dialogSaveException != null)
+            {
+                // C4: the saveAfter existence checks may have caught a partial write;
+                // never leave a bad artifact behind (RunFull refuses to overwrite).
+                CleanupWrittenArtifacts(target, checkPath);
+                throw new Day0GenException("Manager loading dialog: saveAfter delegate failed (fail closed).",
+                    dialogSaveException);
+            }
+            Log.Write("DIALOG: create and saveAfter both completed.");
+
+            // ---- post-save verification (main thread) ------------------------------
+            // zxcheck / read-back / CC assertion / save-list. Any failure here means a
+            // structurally valid but wrong save may be on disk: C4 deletes it before
+            // throwing so a bad save cannot wedge subsequent runs.
             try
             {
-                refl.Invoke("gamesystem.SetLevel(level)", refl.SetLevelMethod, sys, level);
-            }
-            catch (Day0GenException e)
-            {
-                Exception innermost = e;
-                while (innermost.InnerException != null) innermost = innermost.InnerException;
-                if (!(innermost is NullReferenceException))
-                    throw;
-                // SetLevel has already assigned the current-level field and adopted
-                // the level when per-entity scene-object creation NREs out (the NRE
-                // escapes at the DXLevel.cs:438 catch handling). Scene objects are
-                // render-layer only - NOT serialized into saves (rebuilt from
-                // LevelEntities on load) - so this failure is expected to be
-                // recoverable. The two verifications below prove engine-side
-                // completion before any save byte is written; a wrong guess aborts.
-                setLevelSwallowed = true;
-                Log.Write("SetLevel threw (expected: recoverable scene-object failure); verifying engine-side completion...");
-                LogExceptionChain("SETLEVEL swallowed", e);
-            }
+                string sig = (string)refl.Invoke("signing(target,2)", refl.SigningMethod, null, target, 2);
+                string written = File.ReadAllText(checkPath).Trim();
+                if (sig != written)
+                    throw new Day0GenException("zxcheck mismatch: file contains '" + written + "', signer produced '" + sig + "'.");
+                Log.Write("zxcheck verified: " + sig);
 
-            // Post-SetLevel verification - required on BOTH the swallowed and the
-            // clean path; only after both pass may the save proceed.
-            VerifySetLevelEngineCompletion(effectiveSavesDir, zxLogOffset);
-            VerifyCurrentLevelField(sys, level);
-            if (setLevelSwallowed)
-                Log.Write("SETLEVEL VERIFY: PASSED after the swallowed scene-object NRE - " +
-                          "level fully adopted engine-side; proceeding to the save.");
+                object readBack = ReadBackState(target);
+                if (readBack == null)
+                    throw new Day0GenException("Read-back of saved state returned null.");
+                object readName = refl.GetProp("read-back.Name", refl.GameStateType.GetProperty("Name"), readBack);
+                if (string.Compare((string)readName, opts.Name, StringComparison.Ordinal) != 0)
+                    throw new Day0GenException("Read-back name '" + readName + "' != '" + opts.Name + "'.");
+                Log.Write("Read-back OK: ZXGameState named '" + readName + "'.");
 
-            // ---- adopt level into ZXLevelState (SetLevel continuation) --------------
-            // The 17:39 run proved the scene-object NRE escapes BEFORE SetLevel's
-            // new-level branch reaches the ZXLevelState adoption - the state PreSave
-            // dereferences (CurrentGeneratedLevel) was never built. Complete it here.
-            // (sys is needed for step (b): the game system's OnLoad.)
-            AdoptLevelIntoLevelState(ls, sys, level);
+                // Fail-closed: the save is structurally valid but PreSave rebuilds
+                // LevelEntities from the LIVE registry; a missing Command Center there is
+                // silently dropped at write time. Prove it in the saved bytes.
+                AssertReadBackHasCommandCenter(readBack);
 
-            DumpZxLogTail(effectiveSavesDir, 15);
-
-            // During the verification window above the engine's scene machine can
-            // fade back to the START SCREEN; its teardown clears the very statics
-            // the SaveState wrapper depends on (17:35 run), so re-assert first.
-            ReAssertStateBeforeSave(gs, ls, sys);
-
-            // ---- save: the game's own SaveState wrapper (C1) ------------------------
-            // The wrapper (=zSV0_oCta8rEv(name, callback, showWindow, preSave)) is what
-            // the game itself calls: FixFileName(name), pause the engine,
-            // ZXLevelState.PreSave (LevelEntities / CurrentGeneratedLevel.Entities /
-            // ExtraEntities / camera areas - the state every game-written save has),
-            // the native writer (password + Info/Data + zxcheck), unpause. Writing via
-            // the low-level writer directly produced a ZXLevelState shape no
-            // game-written save has ever had, plus an unpaused mutation race. The
-            // wrapper computes the target itself (SavesFolder() + name) and SWALLOWS
-            // writer exceptions (DXLog + error dialog + return), so the existence
-            // checks below are mandatory, not cosmetic.
-            if (refl.SaveStateWrapperMethod != null)
-            {
-                // M1 null-guard: a null manager here is an invariant violation - abort,
-                // never silently downgrade the save path.
-                if (managerInstance == null)
-                    throw new Day0GenException("managerInstance is null - cannot invoke the SaveState wrapper");
-                Log.Write("Saving via the game's SaveState wrapper (pause + PreSave + native writer):" +
-                          " name='" + opts.Name + "', callback=null, showWindow=false, preSave=true.");
-                Log.Write("Wrapper computes its own target from the name; expected: " + target +
-                          " (zxcheck sibling: " + checkPath + ")");
-                refl.Invoke("manager SaveState(name, null, false, true)",
-                    refl.SaveStateWrapperMethod, managerInstance, opts.Name, null, false, true);
-            }
-            else
-            {
-                // C1/M1 hard-error fallback: only reachable on build drift (exact-name
-                // wrapper miss). No NREs on null method bases - abort with a message.
-                Log.Write("WARNING: SaveState wrapper not found by exact name - falling back to the " +
-                          "legacy direct save path (C1 risk: no pause, no PreSave).");
-                if (managerInstance == null)
-                    throw new Day0GenException("managerInstance is null - cannot run the legacy save fallback");
-                if (refl.SaveWriterMethod != null)
+                object list = refl.Invoke("manager save list", refl.SaveListMethod, managerInstance);
+                bool listed = false;
+                System.Collections.IEnumerable en = list as System.Collections.IEnumerable;
+                if (en != null)
                 {
-                    refl.Invoke("manager save writer (native, no PreSave) [C1 fallback]",
-                        refl.SaveWriterMethod, managerInstance, target);
+                    PropertyInfo nameProp = refl.GameStateInfoType.GetProperty("Name");
+                    foreach (object info in en)
+                    {
+                        object n = nameProp.GetValue(info, null);
+                        if (n != null && string.Compare((string)n, opts.Name, StringComparison.Ordinal) == 0)
+                        {
+                            listed = true;
+                            break;
+                        }
+                    }
+                }
+                if (!listed)
+                    throw new Day0GenException("Manager save list does not contain an entry named '" + opts.Name + "'.");
+                Log.Write("Save-list verification OK.");
+            }
+            catch
+            {
+                // C4: only the post-save verification failure path cleans up; the
+                // success path above never deletes.
+                CleanupWrittenArtifacts(target, checkPath);
+                throw;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // C1 strategy (notes/code-review-3.md + notes/loading-dialog-contract.md):
+        // the manager loading dialog runs CreateGameStateAndLevel on a Task thread.
+        // It is the real survival/CC handler's construct -> generate -> SetLevel
+        // sequence (minus the challenge lines) plus the tool's SetLevel continuation
+        // (adopt). It must NOT save - the envelope runs SaveGeneratedState directly on
+        // this same Task right after it returns. A throw here is caught by the envelope,
+        // which then never runs saveAfter, so the run fails closed (the main thread
+        // times out or sees the stored exception).
+        // ---------------------------------------------------------------------
+        private static void CreateGameStateAndLevel()
+        {
+            try
+            {
+                // ---- construction: mirror CC handler minus challenge lines ------------
+                // The dialog has already paused the game, disposed the live menu game
+                // system and set IsLoading; this is the create delegate body.
+                Log.Write("Constructing game state (name='" + opts.Name + "') ...");
+                object gs = refl.Invoke("new ZXGameState(name)", refl.GameStateCtorName, null, opts.Name);
+                refl.Invoke("ZXGameState.Set(gs)", refl.GameStateSetMethod, null, gs);
+                refl.SetProp("gs.GameMode=Survival", refl.GameStateType.GetProperty("GameMode"), gs,
+                             Enum.Parse(refl.GameModeEnum, "Survival"));
+
+                object p = refl.CreateInstance("new ZXRandomLevelParams()", refl.ParamsType);
+                Log.Write("Created ZXRandomLevelParams (defaults untouched except below).");
+                refl.SetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p, opts.Seed);
+                refl.SetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p, opts.NCells);
+                refl.SetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p, opts.Duration);
+                refl.SetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p, opts.Pop);
+                refl.SetProp("params.Name", refl.ParamsType.GetProperty("Name"), p, opts.Name);
+                refl.SetProp("params.ThemeType=None", refl.ParamsType.GetProperty("ThemeType"), p,
+                             Enum.Parse(refl.MapThemeEnum, "None"));
+                // DifficultyType: intentionally left at default (None) - CC handler parity.
+                // ChallengeType: intentionally left Default - never CommunityChallenge.
+
+                refl.SetProp("gs.SurvivalModeParams", refl.GameStateType.GetProperty("SurvivalModeParams"), gs, p);
+
+                object ls = refl.CreateInstance("new ZXLevelState()", refl.LevelStateType);
+                refl.Invoke("ZXLevelState.Set(ls)", refl.LevelStateSetMethod, null, ls);
+                refl.Invoke("ZXLevelState.Init()", refl.LevelStateInitMethod, ls);
+
+                object sys = refl.Invoke("DXSystem.Load<gamesystem>(false)",
+                    refl.DxSystemLoadMethod.MakeGenericMethod(refl.GameSystemType), null, false);
+                refl.SetProp("manager.CurrentGameSystem=sys", refl.CurrentGameSystemProp, managerInstance, sys);
+
+                Log.Write("Effective ZXRandomLevelParams read back before generation:");
+                refl.GetProp("params.Seed", refl.ParamsType.GetProperty("Seed"), p);
+                refl.GetProp("params.NCells", refl.ParamsType.GetProperty("NCells"), p);
+                refl.GetProp("params.ThemeType", refl.ParamsType.GetProperty("ThemeType"), p);
+                refl.GetProp("params.FactorGameDuration", refl.ParamsType.GetProperty("FactorGameDuration"), p);
+                refl.GetProp("params.FactorZombiePopulation", refl.ParamsType.GetProperty("FactorZombiePopulation"), p);
+                refl.GetProp("params.Name", refl.ParamsType.GetProperty("Name"), p);
+
+                Log.Write("Generating level (engine logs 'Random Map Creation with seed: " + opts.Seed + "') ...");
+                object level = refl.Invoke("generator(params)", refl.GenerateMethod, null, p);
+                if (level == null)
+                    throw new Day0GenException("Generator returned null level.");
+
+                // Record the ZXLog byte offset BEFORE SetLevel: its engine-side work
+                // (scene objects, minimap, ChangeScene) logs asynchronously, and the
+                // completion poll below must only look at bytes written after this point.
+                long zxLogOffset = ZxLogLengthBeforeSetLevel(dialogSavesDir);
+
+                bool setLevelSwallowed = false;
+                try
+                {
+                    refl.Invoke("gamesystem.SetLevel(level)", refl.SetLevelMethod, sys, level);
+                }
+                catch (Day0GenException e)
+                {
+                    Exception innermost = e;
+                    while (innermost.InnerException != null) innermost = innermost.InnerException;
+                    if (!(innermost is NullReferenceException))
+                        throw;
+                    // SetLevel has already assigned the current-level field and adopted
+                    // the level when per-entity scene-object creation NREs out (the NRE
+                    // escapes at the DXLevel.cs:438 catch handling). Scene objects are
+                    // render-layer only - NOT serialized into saves (rebuilt from
+                    // LevelEntities on load) - so this failure is expected to be
+                    // recoverable. The two verifications below prove engine-side
+                    // completion before any save byte is written; a wrong guess aborts.
+                    setLevelSwallowed = true;
+                    Log.Write("SetLevel threw (expected: recoverable scene-object failure); verifying engine-side completion...");
+                    LogExceptionChain("SETLEVEL swallowed", e);
+                }
+
+                // Post-SetLevel verification - required on BOTH the swallowed and the
+                // clean path; only after both pass may the save proceed.
+                VerifySetLevelEngineCompletion(dialogSavesDir, zxLogOffset);
+                VerifyCurrentLevelField(sys, level);
+                if (setLevelSwallowed)
+                    Log.Write("SETLEVEL VERIFY: PASSED after the swallowed scene-object NRE - " +
+                              "level fully adopted engine-side; proceeding to the save.");
+
+                // ---- adopt level into ZXLevelState (SetLevel continuation) --------------
+                // The 17:39 run proved the scene-object NRE escapes BEFORE SetLevel's
+                // new-level branch reaches the ZXLevelState adoption - the state PreSave
+                // dereferences (CurrentGeneratedLevel) was never built. Complete it here.
+                AdoptLevelIntoLevelState(ls, sys, level);
+
+                DumpZxLogTail(dialogSavesDir, 15);
+
+                dialogGs = gs;
+                dialogParams = p;
+                dialogLs = ls;
+                dialogSys = sys;
+                dialogLevel = level;
+                Log.Write("CREATE: construct/generate/SetLevel/adopt complete; the dialog will now hand " +
+                          "saveAfter to the engine finish frame.");
+            }
+            catch (Exception ex)
+            {
+                dialogCreateException = ex;
+                Log.Write("CREATE: delegate FAILED - rethrowing so the dialog skips saveAfter (fail closed).");
+                LogExceptionChain("DIALOG CREATE", ex);
+                throw;
+            }
+            finally
+            {
+                if (dialogCreateDone != null) dialogCreateDone.Set();
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // C1 strategy: the envelope's saveAfter delegate, run directly on the create
+        // Task right after CreateGameStateAndLevel returns (the engine is paused, so
+        // there is no frame queue to depend on). The save path is:
+        //   re-assert state -> snapshot the generated level's Entities -> invoke
+        //   ZXLevelState.PreSave explicitly -> overwrite LevelEntities /
+        //   LevelFastSerializedEntities with the snapshot -> native writer.
+        //
+        // WHY not the SaveState wrapper: its PreSave rebuilds LevelEntities from the
+        // LIVE DXGame.ComponentsOfType<CSalvable>() registry (ZXLevelState.cs:1644-1672).
+        // That registry is populated only by scene registration (CreateSceneObject /
+        // AddToScene), and the tolerated scene-object NRE aborts the engine's
+        // registration step, so the rebuild yields nothing and the wrapper writes an
+        // EMPTY save (live-proven: read-back LevelEntities count=0). The native writer
+        // serializes ZXGameState.Current directly, so a hand-built LevelEntities from
+        // the generated level's own entity list is what gets written.
+        //
+        // Exceptions are stored for the main thread (which owns the abort + C4 cleanup);
+        // it never throws at its caller.
+        // ---------------------------------------------------------------------
+        private static void SaveGeneratedState()
+        {
+            try
+            {
+                object gs = dialogGs;
+                object ls = dialogLs;
+                object sys = dialogSys;
+                object level = dialogLevel;
+
+                ReAssertStateBeforeSave(gs, ls, sys);
+
+                // Diagnostic-only (never aborts): locate the Command Center before PreSave.
+                LogCommandCenterDiagnostics(level);
+
+                // 1) SNAPSHOT before PreSave clears the generated level's entity list.
+                PreSaveEntitySnapshot snapshot = BuildPreSaveEntitySnapshot(level);
+
+                // 2) PreSave: clears CurrentGeneratedLevel.Entities + CSalvable
+                //    ExtraEntities, rebuilds the dictionaries from the (empty) live
+                //    registry, and sets the camera areas / fog.
+                if (refl.PreSaveMethod == null)
+                    throw new Day0GenException("ZXLevelState.PreSave (#=zQXHqcVh9mGZZ) not found - " +
+                        "cannot prepare the save state; aborting before the save (fail closed).");
+                if (ls == null)
+                    throw new Day0GenException("dialogLs is null - cannot invoke PreSave");
+                refl.Invoke("ZXLevelState.PreSave() [clear + rebuild]", refl.PreSaveMethod, ls);
+
+                // 3) OVERWRITE with the snapshot; the rebuilt live-registry dicts are empty.
+                PropertyInfo levelEntitiesProp = FindPropertyUp(refl.LevelStateType, "LevelEntities");
+                if (levelEntitiesProp == null)
+                    throw new Day0GenException("Save: ZXLevelState.LevelEntities property not found (build drift?)");
+                PropertyInfo fastProp = FindPropertyUp(refl.LevelStateType, "LevelFastSerializedEntities");
+                if (fastProp == null)
+                    throw new Day0GenException("Save: ZXLevelState.LevelFastSerializedEntities property not found (build drift?)");
+                refl.SetProp("ls.LevelEntities = snapshot (overwrite PreSave's empty rebuild)",
+                    levelEntitiesProp, ls, snapshot.LevelEntities);
+                refl.SetProp("ls.LevelFastSerializedEntities = snapshot (overwrite PreSave's empty rebuild)",
+                    fastProp, ls, snapshot.FastSerializedEntities);
+
+                // 4) Native writer: serializes ZXGameState.Current (re-asserted above), so
+                //    the overwritten dictionaries are what gets written. It throws on
+                //    failure (unlike the old wrapper), so the existence checks below are a
+                //    belt-and-braces check, not the only failure signal.
+                if (refl.SaveWriterMethod == null)
+                    throw new Day0GenException("native save writer (#=zMtGuEM2lBSlZ5BGWvg==) not found - " +
+                        "the primary save path cannot run; aborting (fail closed).");
+                if (managerInstance == null)
+                    throw new Day0GenException("managerInstance is null - cannot invoke the native save writer");
+                Log.Write("Saving via the native writer (serializes ZXGameState.Current directly;" +
+                          " name='" + opts.Name + "', target=" + dialogTarget +
+                          ", zxcheck=" + dialogCheckPath + ").");
+                refl.Invoke("manager native save writer (path)->void", refl.SaveWriterMethod,
+                            managerInstance, dialogTarget);
+
+                if (!File.Exists(dialogTarget))
+                    throw new Day0GenException("Save did not produce " + dialogTarget +
+                        " (the native writer throws on failure - check ZXLog)");
+                if (!File.Exists(dialogCheckPath))
+                    throw new Day0GenException("Save did not produce " + dialogCheckPath +
+                        " (the native writer throws on failure - check ZXLog)");
+                Log.Write("SAVEAFTER: save artifacts exist (" + dialogTarget + " + " + dialogCheckPath + ").");
+            }
+            catch (Exception ex)
+            {
+                dialogSaveException = ex;
+                Log.Write("SAVEAFTER: delegate FAILED - the main thread will abort and clean up (fail closed).");
+                LogExceptionChain("DIALOG SAVEAFTER", ex);
+            }
+            finally
+            {
+                if (dialogSaveDone != null) dialogSaveDone.Set();
+            }
+        }
+
+        // Snapshot of the generated level's serializable entities, built before PreSave
+        // clears the level's own entity list. Plain fields (rather than out params) so
+        // the C#5 audit's inline-out heuristic is not tripped.
+        private sealed class PreSaveEntitySnapshot
+        {
+            public object LevelEntities;
+            public object FastSerializedEntities;
+        }
+
+        // Builds the two entity dictionaries PreSave would normally rebuild from the
+        // live registry, but from the generated level's OWN Entities list (snapshotted
+        // before PreSave clears it). The predicate replicates ZXLevelState.cs:1644-1672:
+        //   LevelEntities: keep when NOT fast-serializing; for a ZXEntity whose life
+        //     IsAlive == false keep only when it is a Structure with IsBeingBuilt == true.
+        //   LevelFastSerializedEntities: fast-serializing ZXEntities whose life is not
+        //     dead, grouped by entity.IDTemplate.Value as (ID, Position) pairs.
+        // A missing filter member logs and fails open (not fast / keep); an unbuildable
+        // DXTupla2<,> omits the fast entities (logged) but never aborts. ID / IDTemplate /
+        // Position are required and abort on a miss (the save would be corrupt otherwise).
+        private static PreSaveEntitySnapshot BuildPreSaveEntitySnapshot(object level)
+        {
+            PropertyInfo entitiesProp = FindPropertyUp(refl.LevelStateType, "LevelEntities");
+            if (entitiesProp == null)
+                throw new Day0GenException("Save snapshot: ZXLevelState.LevelEntities property not found (build drift?)");
+            PropertyInfo fastProp = FindPropertyUp(refl.LevelStateType, "LevelFastSerializedEntities");
+            if (fastProp == null)
+                throw new Day0GenException("Save snapshot: ZXLevelState.LevelFastSerializedEntities property not found (build drift?)");
+
+            object entitiesRaw = ReadMemberValue(level, "Entities");
+            System.Collections.IEnumerable entities = entitiesRaw as System.Collections.IEnumerable;
+            if (entities == null)
+                throw new Day0GenException("Save snapshot: generated level Entities is not IEnumerable (" +
+                                           DescribeValue(entitiesRaw) + ")");
+
+            object levelDictObj = Activator.CreateInstance(entitiesProp.PropertyType);
+            System.Collections.IDictionary levelById = levelDictObj as System.Collections.IDictionary;
+            if (levelById == null)
+                throw new Day0GenException("Save snapshot: LevelEntities type is not IDictionary (" +
+                                           entitiesProp.PropertyType.FullName + ")");
+            object fastDictObj = Activator.CreateInstance(fastProp.PropertyType);
+            System.Collections.IDictionary fastByTemplate = fastDictObj as System.Collections.IDictionary;
+            if (fastByTemplate == null)
+                throw new Day0GenException("Save snapshot: LevelFastSerializedEntities type is not IDictionary (" +
+                                           fastProp.PropertyType.FullName + ")");
+
+            // Predicate members, resolved once. A miss logs and fails open.
+            Type zxEntityType = FindTypeAnyOrder("ZX.Entities.ZXEntity", refl.TabAssembly);
+            PropertyInfo useFastProp = zxEntityType != null ? FindPropertyUp(zxEntityType, "UseFastSerializing") : null;
+            Type structureType = FindTypeAnyOrder("ZX.Entities.Structure", refl.TabAssembly);
+            PropertyInfo beingBuiltProp = structureType != null ? FindPropertyUp(structureType, "IsBeingBuilt") : null;
+            string lifeName = GameReflector.Unescape("_0023_003DzS6TvFuwF_68l");
+            MethodInfo lifeMethod = zxEntityType != null ? FindMethodUp(zxEntityType, lifeName, 0) : null;
+            if (zxEntityType == null)
+                Log.Write("SAVE SNAPSHOT: ZX.Entities.ZXEntity not found - treating every entity as not fast-serializing.");
+            if (useFastProp == null)
+                Log.Write("SAVE SNAPSHOT: ZXEntity.UseFastSerializing not found - treating every entity as not fast-serializing.");
+            if (lifeMethod == null)
+                Log.Write("SAVE SNAPSHOT: ZXEntity life accessor (" + lifeName + ") not found - treating every entity as alive.");
+            if (beingBuiltProp == null)
+                Log.Write("SAVE SNAPSHOT: Structure.IsBeingBuilt not found - dead entities are kept (filter fails open).");
+
+            // DXTupla2<ulong, PointF> construction (fast-serialized entities only).
+            Type tupleDef = FindTypeAnyOrder("DXVision.DXTupla2`2", refl.DxAssembly);
+            if (tupleDef == null)
+                tupleDef = FindGenericTypeBySimpleName(refl.DxAssembly, "DXTupla2", 2);
+            Type tupleType = null;
+            ConstructorInfo tupleCtor = null;
+            FieldInfo tupleAField = null, tupleBField = null;
+            PropertyInfo tupleAProp = null, tupleBProp = null;
+            if (tupleDef != null)
+            {
+                try { tupleType = tupleDef.MakeGenericType(typeof(ulong), typeof(System.Drawing.PointF)); }
+                catch (Exception ex)
+                {
+                    Log.Write("SAVE SNAPSHOT: DXTupla2<,> MakeGenericType(ulong,PointF) failed: " + DescribeException(ex));
+                    tupleType = null;
+                }
+            }
+            if (tupleType != null)
+            {
+                foreach (ConstructorInfo c in tupleType.GetConstructors(
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (c.GetParameters().Length == 2) { tupleCtor = c; break; }
+                }
+                if (tupleCtor == null)
+                {
+                    tupleAField = FindFieldUp(tupleType, "A");
+                    tupleBField = FindFieldUp(tupleType, "B");
+                    if (tupleAField == null) tupleAProp = FindPropertyUp(tupleType, "A");
+                    if (tupleBField == null) tupleBProp = FindPropertyUp(tupleType, "B");
+                }
+            }
+            bool canTuple = tupleType != null &&
+                (tupleCtor != null || ((tupleAField != null || tupleAProp != null) &&
+                                       (tupleBField != null || tupleBProp != null)));
+            if (!canTuple)
+                Log.Write("SAVE SNAPSHOT: DXTupla2<ulong,PointF> unavailable (type=" +
+                          (tupleDef == null ? "not found" : tupleDef.FullName) +
+                          ") - fast-serialized entities will be OMITTED from the save.");
+
+            Type fastListType = fastProp.PropertyType.GetGenericArguments()[1]; // List<DXTupla2<...>>
+            int fastCount = 0, fastOmitted = 0, deadDropped = 0;
+            foreach (object entity in entities)
+            {
+                if (entity == null) continue;
+                bool isZx = zxEntityType != null && zxEntityType.IsInstanceOfType(entity);
+                bool useFast = false;
+                if (isZx && useFastProp != null)
+                {
+                    object uf = useFastProp.GetValue(entity, null);
+                    useFast = uf is bool && (bool)uf;
+                }
+
+                bool alive = true;
+                if (isZx && lifeMethod != null)
+                {
+                    object life = lifeMethod.Invoke(entity, null);
+                    if (life != null) alive = ReadBoolMember(life, "IsAlive", true);
+                }
+
+                if (useFast)
+                {
+                    if (!alive) { deadDropped++; continue; }
+                    fastCount++;
+                    if (!canTuple) { fastOmitted++; continue; }
+                    ulong fastId = Convert.ToUInt64(ReadMemberValue(entity, "ID"), CultureInfo.InvariantCulture);
+                    object pos = ReadMemberValue(entity, "Position");
+                    object idTemplate = ReadMemberValue(entity, "IDTemplate");
+                    if (idTemplate == null)
+                        throw new Day0GenException("Save snapshot: fast entity IDTemplate is null (ID=" + fastId + ")");
+                    // Nullable<T> boxes as its unwrapped value, so a non-null integral IDTemplate
+                    // exposes no "Value" member; only a template-id wrapper needs the member read.
+                    ulong templateKey;
+                    if (idTemplate is ulong || idTemplate is uint || idTemplate is int || idTemplate is long ||
+                        idTemplate is ushort || idTemplate is short || idTemplate is byte || idTemplate is sbyte)
+                        templateKey = Convert.ToUInt64(idTemplate, CultureInfo.InvariantCulture);
+                    else
+                        templateKey = Convert.ToUInt64(ReadMemberValue(idTemplate, "Value"), CultureInfo.InvariantCulture);
+                    object tuple = MakeFastTuple(fastId, pos, tupleCtor, tupleType,
+                                                 tupleAField, tupleBField, tupleAProp, tupleBProp);
+                    if (tuple == null) { fastOmitted++; continue; }
+                    object list = fastByTemplate.Contains(templateKey) ? fastByTemplate[templateKey] : null;
+                    if (list == null)
+                    {
+                        list = Activator.CreateInstance(fastListType);
+                        fastByTemplate[templateKey] = list;
+                    }
+                    ((System.Collections.IList)list).Add(tuple);
                 }
                 else
                 {
-                    ManualSave(target, gs);
+                    bool keep = true;
+                    if (!alive)
+                    {
+                        // PreSave keeps a dead ZXEntity only when it is a Structure being
+                        // built; a discovery miss keeps it (fail open, logged above).
+                        if (structureType == null || beingBuiltProp == null) keep = true;
+                        else if (structureType.IsInstanceOfType(entity)) keep = ReadBoolMember(entity, "IsBeingBuilt", false);
+                        else keep = false;
+                    }
+                    if (!keep) { deadDropped++; continue; }
+                    ulong id = Convert.ToUInt64(ReadMemberValue(entity, "ID"), CultureInfo.InvariantCulture);
+                    levelById[id] = entity;
                 }
             }
-            if (!File.Exists(target))
-                throw new Day0GenException("Save did not produce " + target +
-                    (refl.SaveStateWrapperMethod != null
-                        ? " (the SaveState wrapper swallows writer exceptions - check ZXLog / the engine error popup)"
-                        : ""));
-            if (!File.Exists(checkPath))
-                throw new Day0GenException("Save did not produce " + checkPath +
-                    (refl.SaveStateWrapperMethod != null
-                        ? " (the SaveState wrapper swallows writer exceptions - check ZXLog / the engine error popup)"
-                        : ""));
 
-            // ---- verify ------------------------------------------------------------
-            string sig = (string)refl.Invoke("signing(target,2)", refl.SigningMethod, null, target, 2);
-            string written = File.ReadAllText(checkPath).Trim();
-            if (sig != written)
-                throw new Day0GenException("zxcheck mismatch: file contains '" + written + "', signer produced '" + sig + "'.");
-            Log.Write("zxcheck verified: " + sig);
-
-            object readBack = ReadBackState(target);
-            if (readBack == null)
-                throw new Day0GenException("Read-back of saved state returned null.");
-            object readName = refl.GetProp("read-back.Name", refl.GameStateType.GetProperty("Name"), readBack);
-            if (string.Compare((string)readName, opts.Name, StringComparison.Ordinal) != 0)
-                throw new Day0GenException("Read-back name '" + readName + "' != '" + opts.Name + "'.");
-            Log.Write("Read-back OK: ZXGameState named '" + readName + "'.");
-
-            object list = refl.Invoke("manager save list", refl.SaveListMethod, managerInstance);
-            bool listed = false;
-            System.Collections.IEnumerable en = list as System.Collections.IEnumerable;
-            if (en != null)
+            bool cc = false;
+            foreach (object v in levelById.Values)
             {
-                PropertyInfo nameProp = refl.GameStateInfoType.GetProperty("Name");
-                foreach (object info in en)
+                if (IsCommandCenter(v)) { cc = true; break; }
+            }
+
+            PreSaveEntitySnapshot snapshot = new PreSaveEntitySnapshot();
+            snapshot.LevelEntities = levelDictObj;
+            snapshot.FastSerializedEntities = fastDictObj;
+            Log.Write("SAVE SNAPSHOT: LevelEntities=" + levelById.Count + " (CommandCenter=" + cc +
+                      ", dead/unbuilt dropped=" + deadDropped + "), fast-serialized entities=" + fastCount +
+                      " in " + fastByTemplate.Count + " template group(s)" +
+                      (fastOmitted > 0 ? ", OMITTED=" + fastOmitted : "") + ".");
+            return snapshot;
+        }
+
+        // Constructs one DXTupla2<ulong, PointF> via the 2-arg ctor, or (fallback) the
+        // default ctor + A/B fields/properties. Returns null when neither shape exists,
+        // which the caller counts as an omission (never an abort).
+        private static object MakeFastTuple(ulong id, object pos, ConstructorInfo ctor, Type tupleType,
+            FieldInfo aField, FieldInfo bField, PropertyInfo aProp, PropertyInfo bProp)
+        {
+            if (ctor != null)
+            {
+                ParameterInfo[] ps = ctor.GetParameters();
+                object a = ConvertArg(id, ps[0].ParameterType);
+                object b = ConvertArg(pos, ps[1].ParameterType);
+                return ctor.Invoke(new object[] { a, b });
+            }
+            if (tupleType == null) return null;
+            object t = Activator.CreateInstance(tupleType);
+            if (aField != null) aField.SetValue(t, ConvertArg(id, aField.FieldType));
+            else if (aProp != null && aProp.GetSetMethod(true) != null) aProp.SetValue(t, ConvertArg(id, aProp.PropertyType), null);
+            else return null;
+            if (bField != null) bField.SetValue(t, ConvertArg(pos, bField.FieldType));
+            else if (bProp != null && bProp.GetSetMethod(true) != null) bProp.SetValue(t, ConvertArg(pos, bProp.PropertyType), null);
+            else return null;
+            return t;
+        }
+
+        // Reads a bool property (base chain) then field; returns the fallback on a miss.
+        private static bool ReadBoolMember(object obj, string name, bool fallback)
+        {
+            PropertyInfo p = FindPropertyUp(obj.GetType(), name);
+            if (p != null && p.PropertyType == typeof(bool)) return (bool)p.GetValue(obj, null);
+            FieldInfo f = FindFieldUp(obj.GetType(), name);
+            if (f != null && f.FieldType == typeof(bool)) return (bool)f.GetValue(obj);
+            return fallback;
+        }
+
+        // Finds an instance/static method by real metadata name + arg count, walking the
+        // base chain (DeclaredOnly per level so an override wins over a base declaration).
+        private static MethodInfo FindMethodUp(Type t, string name, int argCount)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                MethodInfo[] ms = null;
+                try
                 {
-                    object n = nameProp.GetValue(info, null);
-                    if (n != null && string.Compare((string)n, opts.Name, StringComparison.Ordinal) == 0)
+                    ms = cur.GetMethods(BindingFlags.Instance | BindingFlags.Static |
+                                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (ms == null) continue;
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name == name && m.GetParameters().Length == argCount) return m;
+                }
+            }
+            return null;
+        }
+
+        // Fallback generic-type resolution (used only when the exact DXVision.DXTupla2`2
+        // name misses): scan the assembly for a generic definition with the arity and the
+        // simple-name prefix.
+        private static Type FindGenericTypeBySimpleName(Assembly asm, string simpleName, int typeArgCount)
+        {
+            Type[] types = GameReflector.SafeGetTypes(asm);
+            for (int i = 0; i < types.Length; i++)
+            {
+                Type t = types[i];
+                if (t == null || !t.IsGenericTypeDefinition) continue;
+                if (t.Name != null && t.Name.StartsWith(simpleName, StringComparison.Ordinal) &&
+                    t.GetGenericArguments().Length == typeArgCount)
+                    return t;
+            }
+            return null;
+        }
+
+        // ---------------------------------------------------------------------
+        // Start-game envelope: replicate the manager loading dialog's non-animation
+        // lifecycle directly (notes/loading-dialog-contract.md). The dialog's dispatch
+        // is gated on an overlay fade animation and drops the delegate when
+        // DXGame.Scene == null, so relying on it stalled the live run after ChangeScene
+        // (create never started). This runs the same events with no animation/scene
+        // dependency: pause the engine, dispose+null the live game system, set IsLoading,
+        // run create on a Task (so SetLevel's InvokeOnStartFrame+WaitOne still signals),
+        // then run saveAfter directly on that same Task right after create returns. The
+        // engine is paused by the envelope, so the frame queue is not draining and the
+        // dialog's engine start-frame saveAfter handoff (InvokeOnStartFrame) never ran in
+        // the live run; a direct call needs no frame pump. The UI mutation runs on the
+        // engine UI thread (RunOnEngineUiThread) because the dialog itself did; nothing
+        // invokes the dialog anymore.
+        // ---------------------------------------------------------------------
+        private static void InvokeStartGameEnvelope(Action createAction, Action saveAfterAction)
+        {
+            // Discovery. DXVision is embedded/undecrypted, so every shape is resolved at
+            // runtime via stable engine names; a required miss aborts (never runs create
+            // inline - that reintroduces the out-of-band crash review #3 identified).
+            Type dxGameType = FindTypeAnyOrder("DXVision.DXGame", refl.DxAssembly);
+            if (dxGameType == null)
+                throw new Day0GenException("Start-game envelope: DXVision.DXGame type not discovered - " +
+                    "cannot pause/dispose (aborting; no inline fallback). See notes/loading-dialog-contract.md.");
+
+            PropertyInfo dxCurrentProp = FindPropertyUp(dxGameType, "Current");
+            if (dxCurrentProp != null)
+            {
+                MethodInfo currentGetter = dxCurrentProp.GetGetMethod(true);
+                if (currentGetter == null || !currentGetter.IsStatic) dxCurrentProp = null;
+            }
+            FieldInfo dxCurrentField = (dxCurrentProp == null) ? FindFieldUp(dxGameType, "Current") : null;
+            if (dxCurrentField != null && !dxCurrentField.IsStatic) dxCurrentField = null;
+            if (dxCurrentProp == null && dxCurrentField == null)
+                throw new Day0GenException("Start-game envelope: DXVision.DXGame.Current (static property/field) " +
+                    "not discovered - aborting (no inline fallback).");
+
+            PropertyInfo pausedProp = FindPropertyUp(dxGameType, "Paused");
+            if (pausedProp != null && (pausedProp.PropertyType != typeof(bool) || pausedProp.GetSetMethod(true) == null))
+                pausedProp = null;
+            FieldInfo pausedField = FindFieldUp(dxGameType, "Paused");
+            if (pausedField != null && (pausedField.FieldType != typeof(bool) || pausedField.IsInitOnly))
+                pausedField = null;
+            if (pausedProp == null && pausedField == null)
+                throw new Day0GenException("Start-game envelope: DXVision.DXGame.Paused (bool, writable) not " +
+                    "discovered - aborting (no inline fallback).");
+
+            if (refl.CurrentGameSystemProp == null)
+                throw new Day0GenException("Start-game envelope: manager.CurrentGameSystem property not " +
+                    "discovered - aborting (no inline fallback).");
+            if (managerInstance == null)
+                throw new Day0GenException("Start-game envelope: managerInstance is null - cannot pause/dispose " +
+                    "(aborting; no inline fallback).");
+
+            // IsLoading is optional (the dialog sets it, but the envelope works without it).
+            PropertyInfo isLoadingProp = FindPropertyUp(refl.ManagerType, "IsLoading");
+            if (isLoadingProp != null && (isLoadingProp.PropertyType != typeof(bool) ||
+                isLoadingProp.GetSetMethod(true) == null))
+                isLoadingProp = null;
+            FieldInfo isLoadingField = FindFieldUp(refl.ManagerType, "IsLoading");
+            if (isLoadingField != null && (isLoadingField.FieldType != typeof(bool) || isLoadingField.IsInitOnly))
+                isLoadingField = null;
+            if (isLoadingProp == null && isLoadingField == null)
+                Log.Write("ENVELOPE: manager.IsLoading not found - skipped (optional).");
+
+            Log.Write("ENVELOPE: discovered DXGame.Current, DXGame.Paused, " +
+                      "manager.CurrentGameSystem, manager.IsLoading=" +
+                      (isLoadingProp != null || isLoadingField != null));
+
+            MethodInvoker runEnvelope = delegate()
+            {
+                object game = dxCurrentProp != null ? dxCurrentProp.GetValue(null, null) : dxCurrentField.GetValue(null);
+                if (game == null)
+                    throw new Day0GenException("Start-game envelope: DXVision.DXGame.Current is null - cannot " +
+                        "pause/dispose (aborting; no inline fallback).");
+                Log.Write("ENVELOPE: DXGame.Current = " + game.GetType().FullName + " - pausing the engine.");
+                if (pausedProp != null) pausedProp.SetValue(game, true, null);
+                else pausedField.SetValue(game, true);
+                Log.Write("ENVELOPE: DXGame.Current.Paused = true.");
+
+                object sys = refl.GetProp("manager.CurrentGameSystem (envelope)",
+                    refl.CurrentGameSystemProp, managerInstance);
+                if (sys != null)
+                {
+                    Log.Write("ENVELOPE: disposing previous game system " + sys.GetType().FullName + ".");
+                    SetEnvelopeBool(sys, "Enabled", false);
+                    InvokeSystemDispose(sys);
+                    refl.SetProp("manager.CurrentGameSystem=null (envelope)",
+                        refl.CurrentGameSystemProp, managerInstance, null);
+                    Log.Write("ENVELOPE: previous game system disposed; manager.CurrentGameSystem = null.");
+                }
+                else
+                {
+                    Log.Write("ENVELOPE: manager.CurrentGameSystem already null - nothing to dispose.");
+                }
+
+                if (isLoadingProp != null) isLoadingProp.SetValue(managerInstance, true, null);
+                else if (isLoadingField != null) isLoadingField.SetValue(managerInstance, true);
+                if (isLoadingProp != null || isLoadingField != null)
+                    Log.Write("ENVELOPE: manager.IsLoading = true.");
+
+                Log.Write("ENVELOPE: starting create+save on a Task (engine paused; no frame-queue dependency).");
+                System.Threading.Tasks.Task.Factory.StartNew(delegate()
+                {
+                    try
                     {
-                        listed = true;
-                        break;
+                        createAction();
+                        saveAfterAction();
+                    }
+                    catch (Exception ex)
+                    {
+                        dialogCreateException = ex;
+                        Log.Write("ENVELOPE: create/save FAILED - signaling the main thread (fail closed).");
+                        LogExceptionChain("ENVELOPE CREATE", ex);
+                        if (dialogSaveDone != null) dialogSaveDone.Set();
+                    }
+                });
+            };
+            RunOnEngineUiThread("start-game envelope",
+                "if no save appears, the envelope's create+save Task stalled or threw before signaling; " +
+                "check ZXLog.",
+                runEnvelope);
+        }
+
+        // Writes a bool member (property or field) on an engine object. Enabled is not in
+        // the envelope's required set, so a miss is logged and skipped.
+        private static void SetEnvelopeBool(object target, string name, bool value)
+        {
+            PropertyInfo p = FindPropertyUp(target.GetType(), name);
+            if (p != null && (p.PropertyType != typeof(bool) || p.GetSetMethod(true) == null)) p = null;
+            FieldInfo f = FindFieldUp(target.GetType(), name);
+            if (f != null && (f.FieldType != typeof(bool) || f.IsInitOnly)) f = null;
+            if (p == null && f == null)
+            {
+                Log.Write("ENVELOPE: " + name + " not found on " + target.GetType().FullName + " - skipped.");
+                return;
+            }
+            if (p != null) p.SetValue(target, value, null);
+            else f.SetValue(target, value);
+            Log.Write("ENVELOPE: " + name + " = " + value + ".");
+        }
+
+        // Calls the engine's instance Dispose() on the previous game system. Prefers the
+        // reflected 0-arg method; falls back to IDisposable.
+        private static void InvokeSystemDispose(object sys)
+        {
+            MethodInfo dispose = null;
+            for (Type cur = sys.GetType(); cur != null && dispose == null; cur = cur.BaseType)
+            {
+                MethodInfo[] ms = null;
+                try
+                {
+                    ms = cur.GetMethods(BindingFlags.Instance | BindingFlags.Public |
+                                        BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (ms == null) continue;
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name == "Dispose" && m.GetParameters().Length == 0) { dispose = m; break; }
+                }
+            }
+            if (dispose != null)
+            {
+                refl.Invoke("envelope: previous game system Dispose()", dispose, sys);
+                return;
+            }
+            IDisposable disposable = sys as IDisposable;
+            if (disposable != null)
+            {
+                disposable.Dispose();
+                Log.Write("ENVELOPE: previous game system disposed via IDisposable.");
+                return;
+            }
+            Log.Write("ENVELOPE: previous game system exposes no Dispose() - skipped.");
+        }
+
+        // C4: a written-but-bad save must not survive. RunFull refuses to overwrite an
+        // existing target, so leaving the file wedges every subsequent run until an
+        // operator deletes it. Called ONLY on the post-save failure path.
+        private static void CleanupWrittenArtifacts(string target, string checkPath)
+        {
+            string dir = Path.GetDirectoryName(target);
+            string[] paths = new string[]
+            {
+                target,
+                checkPath,
+                Path.Combine(dir, Path.GetFileNameWithoutExtension(target) + "_Crash" + Path.GetExtension(target)),
+                Path.Combine(dir, Path.GetFileNameWithoutExtension(checkPath) + "_Crash" + Path.GetExtension(checkPath))
+            };
+            foreach (string path in paths)
+            {
+                try
+                {
+                    if (File.Exists(path))
+                    {
+                        File.Delete(path);
+                        Log.Write("CLEANUP: deleted bad save artifact " + path);
                     }
                 }
+                catch (Exception ex)
+                {
+                    Log.Write("CLEANUP: failed to delete " + path + ": " + ex.GetType().Name + ": " + ex.Message);
+                }
             }
-            if (!listed)
-                throw new Day0GenException("Manager save list does not contain an entry named '" + opts.Name + "'.");
-            Log.Write("Save-list verification OK.");
         }
 
         // ---------------------------------------------------------------------
@@ -4427,7 +5520,7 @@ namespace Day0Gen
         // ---------------------------------------------------------------------
         private static void ReAssertStateBeforeSave(object gs, object ls, object sys)
         {
-            Log.Write("RE-ASSERT: checking ZXGameState.Current / ZXLevelState.Current / " +
+            Log.Write("RE-ASSERT: checking DXLevel.Current / ZXGameState.Current / ZXLevelState.Current / " +
                       "manager.CurrentGameSystem before the save ...");
             bool gsReasserted = ReAssertStaticCurrent("ZXGameState",
                 refl.GameStateCurrentMethod, refl.GameStateSetMethod, gs);
@@ -4458,7 +5551,44 @@ namespace Day0Gen
                 }
             }
 
-            Log.Write("RE-ASSERT: summary - ZXGameState.Current " + (gsReasserted ? "RE-ASSERTED" : "ok") +
+            // C2 (review #3): DXLevel.Current is the gate PreSave branches on
+            // (ZXLevelState.cs:1630: `if (DXLevel.Current == null) return;`). If the
+            // post-SetLevel start-screen teardown nulls it, PreSave early-returns and
+            // the save is structurally empty even though the three statics above are
+            // fine. Same accessors as the adopt precondition; abort if it will not stick.
+            bool dxLevelReasserted = false;
+            {
+                PropertyInfo levelProp = FindDxLevelCurrentProp();
+                FieldInfo levelField = (levelProp != null) ? null : FindDxLevelCurrentField();
+                if (levelProp == null && levelField == null)
+                    throw new Day0GenException("Re-assert failed: DXLevel.Current is neither a settable static " +
+                        "property nor a writable static field - cannot verify the PreSave precondition; " +
+                        "aborting before the save.");
+                object currentLevel = levelProp != null
+                    ? refl.GetProp("DXLevel.Current (re-assert check)", levelProp, null)
+                    : levelField.GetValue(null);
+                if (!ReferenceEquals(currentLevel, dialogLevel))
+                {
+                    Log.Write("RE-ASSERT: DXLevel.Current -> " +
+                              (currentLevel == null ? "null" : currentLevel.GetType().FullName) +
+                              " (!= our level); re-asserting ...");
+                    if (levelProp != null)
+                        refl.SetProp("DXLevel.Current=level (re-assert)", levelProp, null, dialogLevel);
+                    else
+                        levelField.SetValue(null, dialogLevel);
+                    dxLevelReasserted = true;
+                    object afterLevel = levelProp != null
+                        ? refl.GetProp("DXLevel.Current (re-assert recheck)", levelProp, null)
+                        : levelField.GetValue(null);
+                    if (!ReferenceEquals(afterLevel, dialogLevel))
+                        throw new Day0GenException("Re-assert failed: DXLevel.Current still does not reference our " +
+                            "level (now: " + (afterLevel == null ? "null" : afterLevel.GetType().FullName) +
+                            ") - PreSave would early-return; aborting before the save.");
+                }
+            }
+
+            Log.Write("RE-ASSERT: summary - DXLevel.Current " + (dxLevelReasserted ? "RE-ASSERTED" : "ok") +
+                      ", ZXGameState.Current " + (gsReasserted ? "RE-ASSERTED" : "ok") +
                       ", ZXLevelState.Current " + (lsReasserted ? "RE-ASSERTED" : "ok") +
                       ", manager.CurrentGameSystem " + (sysReasserted ? "RE-ASSERTED" : "ok") + ".");
         }
@@ -4505,6 +5635,231 @@ namespace Day0Gen
             Log.Write("Manual save composition done (zxcheck: " + sig + ").");
         }
 
+        // ---------------------------------------------------------------------
+        // Command Center verification + diagnostics.
+        //
+        // ZXLevelState.PreSave rebuilds LevelEntities from the LIVE
+        // DXGame.Current.ComponentsOfType<CSalvable>() registry after clearing the
+        // generated level's entities (ZXLevelState.cs:1633-1657). The Command Center
+        // is serialized only if it is present in that live registry; if it is not, the
+        // save silently loads without one. AssertReadBackHasCommandCenter turns that
+        // silent drop into a hard failure; LogCommandCenterDiagnostics is the
+        // pre-save probe for WHERE the CC is (or is not).
+        // ---------------------------------------------------------------------
+        private static void AssertReadBackHasCommandCenter(object readBack)
+        {
+            PropertyInfo lsProp = FindPropertyUp(refl.GameStateType, "LevelState");
+            if (lsProp == null)
+                throw new Day0GenException("Read-back CC check: ZXGameState.LevelState property not found (build drift?)");
+            object readLs = lsProp.GetValue(readBack, null);
+            if (readLs == null)
+                throw new Day0GenException("saved ZXGameState.LevelState is null - the save would load without a command center");
+            PropertyInfo entitiesProp = refl.LevelStateType.GetProperty("LevelEntities");
+            if (entitiesProp == null)
+                throw new Day0GenException("Read-back CC check: ZXLevelState.LevelEntities property not found (build drift?)");
+            object entities = entitiesProp.GetValue(readLs, null);
+            int count = 0;
+            bool ccPresent = false;
+            if (entities != null)
+            {
+                System.Collections.IDictionary dict = entities as System.Collections.IDictionary;
+                if (dict == null)
+                    throw new Day0GenException("Read-back CC check: saved LevelEntities is not IDictionary (" +
+                                               DescribeValue(entities) + ") - cannot verify the command center");
+                foreach (object val in dict.Values)
+                {
+                    count++;
+                    if (IsCommandCenter(val)) ccPresent = true;
+                }
+            }
+            Log.Write("Read-back LevelEntities count=" + count + ", commandCenterPresent=" + ccPresent + ".");
+            if (entities == null || count == 0 || !ccPresent)
+                throw new Day0GenException("saved LevelEntities has no CommandCenter (count=" + count +
+                    ", CC found=" + ccPresent + ") - the save would load without a command center");
+        }
+
+        // Diagnostics-only (never aborts): each probe is independently guarded - a
+        // discovery/reflection failure logs "(skipped: ...)" and the next continues.
+        private static void LogCommandCenterDiagnostics(object level)
+        {
+            // (a) live DXGame.Current.ComponentsOfType<CSalvable>() - the registry
+            // PreSave rebuilds LevelEntities from.
+            try
+            {
+                Type dxGameType = FindTypeAnyOrder("DXVision.DXGame", refl.DxAssembly);
+                if (dxGameType == null)
+                    throw new Day0GenException("DXVision.DXGame type not found");
+                object current = GetStaticMemberValue(dxGameType, "Current");
+                if (current == null)
+                {
+                    Log.Write("CC DIAG: live DXGame.Current is null (skipped: no game instance)");
+                }
+                else
+                {
+                    MethodInfo comps = FindComponentsOfTypeMethod(dxGameType);
+                    if (comps == null)
+                        throw new Day0GenException("DXGame.ComponentsOfType<T>() not found on DXGame/base chain");
+                    Type csalvable = FindTypeAnyOrder("ZX.Components.CSalvable", refl.TabAssembly);
+                    if (csalvable == null)
+                        throw new Day0GenException("ZX.Components.CSalvable type not found");
+                    MethodInfo closed = comps.MakeGenericMethod(csalvable);
+                    object boxed = closed.Invoke(comps.IsStatic ? null : current, null);
+                    int n = 0;
+                    bool cc = false;
+                    System.Collections.IEnumerable e = boxed as System.Collections.IEnumerable;
+                    if (e != null)
+                    {
+                        foreach (object o in e)
+                        {
+                            n++;
+                            if (IsCommandCenter(o)) cc = true;
+                        }
+                    }
+                    Log.Write("CC DIAG: live DXGame CSalvable components = " + n +
+                              ", CommandCenter present = " + cc);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("CC DIAG: live DXGame CSalvable components (skipped: " + DescribeException(ex) + ")");
+            }
+
+            // (b) generated level: Entities + Extension.MapDrawer.ExtraEntities.
+            // The CC is created into ExtraEntities and moved into Entities by
+            // SetLevel/UpdateLevel (ZXMapDrawer.cs:910/1420-1423, :1457).
+            string entitiesDesc = "(skipped: not probed)";
+            try { entitiesDesc = DescribeEntityCollection(ReadMemberValue(level, "Entities")); }
+            catch (Exception ex) { entitiesDesc = "(skipped: " + DescribeException(ex) + ")"; }
+            string extrasDesc = "(skipped: not probed)";
+            try
+            {
+                object ext = ReadMemberValue(level, "Extension");
+                if (ext == null)
+                    throw new Day0GenException("DXLevel.Extension is null");
+                object drawer = ReadMemberValue(ext, "MapDrawer");
+                if (drawer == null)
+                    throw new Day0GenException("ZXLevelExtension.MapDrawer is null");
+                extrasDesc = DescribeEntityCollection(ReadMemberValue(drawer, "ExtraEntities"));
+            }
+            catch (Exception ex) { extrasDesc = "(skipped: " + DescribeException(ex) + ")"; }
+            Log.Write("CC DIAG: generated level Entities=" + entitiesDesc + ", ExtraEntities=" + extrasDesc);
+
+            // (c) ZXLevelState.Current.LevelEntities - null after the adopt by design.
+            try
+            {
+                object currentLs = refl.LevelStateCurrentMethod != null
+                    ? refl.LevelStateCurrentMethod.Invoke(null, null)
+                    : null;
+                object ents = null;
+                if (currentLs != null)
+                {
+                    PropertyInfo p = refl.LevelStateType.GetProperty("LevelEntities");
+                    if (p != null) ents = p.GetValue(currentLs, null);
+                }
+                Log.Write("CC DIAG: ZXLevelState.Current.LevelEntities = " + (ents == null ? "null" : "NON-NULL") +
+                          " (null after the adopt by design; log only).");
+            }
+            catch (Exception ex)
+            {
+                Log.Write("CC DIAG: ZXLevelState.Current.LevelEntities (skipped: " + DescribeException(ex) + ")");
+            }
+        }
+
+        // Discover ZX.Entities.CommandCenter by name and match by runtime type chain.
+        // Falls back to a base-chain name check so a discovery miss cannot silently
+        // pass an entity through.
+        private static bool IsCommandCenter(object entity)
+        {
+            if (entity == null) return false;
+            Type ccType = FindTypeAnyOrder("ZX.Entities.CommandCenter", refl.TabAssembly);
+            if (ccType != null)
+                return ccType.IsInstanceOfType(entity);
+            for (Type t = entity.GetType(); t != null; t = t.BaseType)
+            {
+                if (t.FullName != null && t.FullName.EndsWith(".CommandCenter", StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
+
+        // Static member read for diagnostics: property (base chain) first, then field.
+        private static object GetStaticMemberValue(Type t, string name)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                PropertyInfo p = null;
+                try
+                {
+                    p = cur.GetProperty(name, BindingFlags.Static | BindingFlags.Public |
+                                              BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (p != null && p.GetGetMethod(true) != null)
+                    return p.GetValue(null, null);
+                FieldInfo f = null;
+                try
+                {
+                    f = cur.GetField(name, BindingFlags.Static | BindingFlags.Public |
+                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (f != null) return f.GetValue(null);
+            }
+            return null;
+        }
+
+        // Instance member read for diagnostics: property (base chain) first, then field.
+        private static object ReadMemberValue(object obj, string name)
+        {
+            if (obj == null)
+                throw new Day0GenException("cannot read " + name + " from a null object");
+            PropertyInfo p = FindPropertyUp(obj.GetType(), name);
+            if (p != null) return p.GetValue(obj, null);
+            FieldInfo f = FindFieldUp(obj.GetType(), name);
+            if (f != null) return f.GetValue(obj);
+            throw new Day0GenException(name + " member not found on " + obj.GetType().FullName);
+        }
+
+        // DXGame.ComponentsOfType<T>() discovery: static or instance, 0 args, generic
+        // method definition, on DXGame or its base chain.
+        private static MethodInfo FindComponentsOfTypeMethod(Type t)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                MethodInfo[] ms = null;
+                try
+                {
+                    ms = cur.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public |
+                                        BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (ms == null) continue;
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name != "ComponentsOfType") continue;
+                    if (!m.IsGenericMethodDefinition) continue;
+                    if (m.GetParameters().Length != 0) continue;
+                    return m;
+                }
+            }
+            return null;
+        }
+
+        private static string DescribeEntityCollection(object coll)
+        {
+            if (coll == null) return "null";
+            System.Collections.IEnumerable e = coll as System.Collections.IEnumerable;
+            if (e == null) return "not-enumerable(" + DescribeValue(coll) + ")";
+            int n = 0;
+            bool cc = false;
+            foreach (object o in e)
+            {
+                n++;
+                if (IsCommandCenter(o)) cc = true;
+            }
+            return "Count=" + n + ", CommandCenter=" + cc;
+        }
+
         private static object ReadBackState(string target)
         {
             // Replicates the game's load path: flag(path) -> set password -> read
@@ -4512,11 +5867,39 @@ namespace Day0Gen
             object flagObj = refl.Invoke("password flag(target)", refl.FlagMethod, null, target);
             int flag = (int)flagObj;
             refl.Invoke("password generator(set,read)", refl.PwdSetMethod, null, target, flag, true);
-            object state;
-            if (refl.ZxFileReadMethod != null)
-                state = refl.Invoke("ZXFile<ZXGameState>.read(target)", refl.ZxFileReadMethod, null, target);
-            else
-                state = refl.Invoke("ZipSerializer.Read(target,'Data')", refl.ZipReadMethod, null, target, "Data");
+            // The game's own load path reads the ZIP "Data" entry via
+            // ZipSerializer.Read(path, entry) after the password is set (manager
+            // #=z3YFOTVtBw_rT7oSQRA==). Prefer it; ZXFile<ZXGameState>.read (the mod
+            // reader) is only a fallback - it can return null where the ZIP reader
+            // yields the state byte-for-byte as the game stored it.
+            object state = null;
+            Day0GenException zipReaderError = null;
+            if (refl.ZipReadMethod != null)
+            {
+                try
+                {
+                    state = refl.Invoke("ZipSerializer.Read(target,'Data')", refl.ZipReadMethod, null, target, "Data");
+                    Log.Write(state != null
+                        ? "Read-back reader: ZipSerializer.Read(path,'Data') (game load path)."
+                        : "Read-back reader: ZipSerializer.Read(path,'Data') returned null.");
+                }
+                catch (Day0GenException e)
+                {
+                    zipReaderError = e;
+                    Log.Write("Read-back: ZipSerializer.Read(path,'Data') failed: " + e.Message);
+                }
+            }
+            if (state == null && refl.ZxFileReadMethod != null)
+            {
+                state = refl.Invoke("ZXFile<ZXGameState>.read(target) [fallback]",
+                                    refl.ZxFileReadMethod, null, target);
+                Log.Write("Read-back reader: ZXFile<ZXGameState>.read fallback (ZipSerializer " +
+                          (zipReaderError == null ? "returned null." : "failed.") + ")");
+            }
+            else if (state == null && zipReaderError != null)
+            {
+                throw zipReaderError;
+            }
             if (refl.PwdClearMethod != null)
             {
                 try { refl.Invoke("password generator(clear,read)", refl.PwdClearMethod, null, target, flag, true); }

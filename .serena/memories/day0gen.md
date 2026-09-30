@@ -390,3 +390,244 @@ VERIFIED on target-host (2026-09-29 19:39, `--phase discovery`, exit 0):
 followed by `FOUND [exact-name] fog system type` and `PHASE discovery COMPLETE`. This confirms the
 C1 decode (the `_2CDe` is literal; the type IS in TheyAreBillions/TabAssembly) and that the old
 abort at `src/Day0Gen.cs:810` is gone. C2 fallback did not need to run (exact hit).
+
+## Instrumentation pass: read-back reader + CC fail-closed + crash-save allow-list (build+audit clean, NOT committed/deployed)
+
+`src/Day0Gen.cs` only; no behavior fix (no early `DXLevel.Current`, no manual entity registration).
+Root cause localized: `ZXLevelState.PreSave` (ZXLevelState.cs:1633-1657) CLEARS the generated level's
+`Entities` + CSalvable ExtraEntities and rebuilds `LevelEntities` from the LIVE
+`DXGame.Current.ComponentsOfType<CSalvable>()`; if the CC is absent there it is silently dropped.
+
+- **Reader fix** (`ReadBackState`, ~4773): prefer `refl.ZipReadMethod` with entry `"Data"` (the game's
+  own load path) as PRIMARY; `ZXFile<ZXGameState>.read` only if Zip read is null/throws. Logs which
+  reader produced the state. Password flag/set/clear cycle unchanged. Prior reader returned null.
+- **Fail-closed CC assertion** (`AssertReadBackHasCommandCenter`, ~4541; call ~4065): after read-back
+  Name check, navigates `ZXGameState.LevelState` -> `ZXLevelState.LevelEntities` (IDictionary), counts
+  and detects `ZX.Entities.CommandCenter` (`IsCommandCenter`, ~4663; type-by-name with base-chain name
+  fallback). Logs `Read-back LevelEntities count=N, commandCenterPresent=<bool>`; throws `Day0GenException`
+  ("saved LevelEntities has no CommandCenter (count=..., CC found=false) - the save would load without a
+  command center") when LevelState null / entities null/empty / no CC.
+- **Pre-save diagnostics** (`LogCommandCenterDiagnostics`, ~4575; call ~3992 after `ReAssertStateBeforeSave`):
+  all probes try/catch, never abort, `(skipped: ...)` on failure. (a) `DXVision.DXGame.Current` +
+  `ComponentsOfType<CSalvable>()` -> `CC DIAG: live DXGame CSalvable components = N, CommandCenter present = <bool>`;
+  (b) generated `level.Entities` + `level.Extension.MapDrawer.ExtraEntities` -> `CC DIAG: generated level
+  Entities=..., ExtraEntities=...`; (c) `ZXLevelState.Current.LevelEntities` null/non-null.
+- **Allow-list tolerance** (~3826): derived `<stem>_Crash.zxsav`/`.zxcheck` next to target are allowed
+  via `CHANGE (engine crash save, allowed): <path>`; `targetSeen`/`checkSeen` still required.
+
+UNVERIFIED: which reader actually returns non-null on the target; whether the live registry contains the
+CC (the diagnostics answer this on the next run); whether `ComponentsOfType<T>()` is on `DXGame`/base vs an
+extension method (probe logs skipped if not found).
+
+## Entity-default-params readiness gate (build+audit clean, NOT committed/deployed)
+
+Race fix for the generator `KeyNotFoundException` (`ZXEntity.#=zthu8vuk=()` ->
+`DXEntity.CreateInstance()`): the manager's `Dictionary<string, ZXEntityDefaultParams>` field
+`#=zpPzF4$N2I2orD2rOLw==` is populated inside `#=zCr_j9C0uHkPXZ$SDGA==` (a
+`PostMethods_OnStartFrame` action) which runs AFTER `CurrentProject = DXProject.LoadFromFile(...)`.
+`WaitForProjectContext` (FromID non-null) passes at the LoadFromFile boundary, so the generator
+could run while the dict was still filling.
+
+New `WaitForEntityDefaultParamsGate()` (`src/Day0Gen.cs` ~1958), called in
+`RunConstructGenerateSave` right after `ReVerifyThemeTableQuick()` and before the generator
+invoke:
+- **Dict field discovery**: unique INSTANCE field on `refl.ManagerType` (base chain walked) whose
+  field type is generic `Dictionary<,>` with a value type whose name ends with
+  `ZXEntityDefaultParams` (or equals the discovered `ZX.ZXEntityDefaultParams` type; exact name
+  tried first, then `ZX.EntityDefaultParams`, then simple-name-suffix scan over both assemblies).
+  No hardcoded escaped field name.
+- **Expected count**: computed once from `DXProject.EntityTemplates` (`FindPropertyUp`/`FindFieldUp`,
+  `FromID(ProjectId)` primary, `Current` fallback) = number of template values whose `Entity`
+  property is a `ZX.Entities.ZXEntity` (`IsInstanceOfType`; exact name then suffix scan).
+- **Poll** up to 120 s @500 ms until `dict.Count >= expected` (and, when the CC template name at
+  `EntityTemplates[GenProbeCommandCenterTemplateId]` resolves, `dict.Contains(ccName)`). Every dict
+  read is try/catch wrapped; progress logged every ~5 s as
+  `ENTITY PARAMS GATE: dict count=N / expected=M (poll k)`. Timeout/engine-death -> `Day0GenException`.
+- **Fail-open only on discovery failure**: logs
+  `ENTITY PARAMS GATE: skipped (<reason>) - cannot verify manager entity-default-params readiness`
+  and returns (the generator still fails closed on its own).
+
+UNVERIFIED: live readiness (dict count vs expected, CC key present) and whether a real run now wins
+the race; expected-count computation assumes `EntityTemplates` values expose an `Entity` property.
+
+## Start-screen settle gate (build+audit clean, NOT committed/deployed)
+
+Root cause of the wiped level (latest interactive ZXLog): the engine's STARTUP
+fade-to-start-screen transition completes AFTER `SetLevel`. Its `onFinish` runs
+`ChangeScene -> ZXSystem_StartScreen - Load/ShowScene`, whose teardown tears down the game
+level and wipes every entity before the save. Order in ZXLog: `ZXGame - ShowStartScreen` /
+`ChangeScene - Init/Paused/Fade - True With onFinish` ... our generator + `SetLevel`
+(`GameLevel - LoadLevel - Begin ... Minimap OK`) ... `ZXGame - Fade - onFinish` /
+`ChangeScene - loadScene -> ZXSystem_StartScreen - Load -> ShowScene -> ShowSceneSuccess`.
+
+New `WaitForStartScreenSettled(savesDir)` in `src/Day0Gen.cs`, called in
+`RunConstructGenerateSave` immediately AFTER `WaitForEntityDefaultParamsGate()` and BEFORE the
+generator invoke: polls ZXLog.txt (WHOLE-FILE scan via `ReadZxLogPortion(savesDir, 0)` - the
+transition may already have completed during earlier readiness waits; the engine truncates the
+log on start so whole-file is correct) every 500 ms up to 90 s for the ASCII marker
+`ZXSystem_StartScreen - ShowSceneSuccess`. Logs `STARTSCREEN GATE: waiting for
+'<marker>' (poll k)` every ~10 polls, and `STARTSCREEN GATE: engine settled on the start screen
+after k poll(s).` on success. FAIL-OPEN: timeout / unreadable ZXLog logs
+`STARTSCREEN GATE: marker not seen after 90s (engine may still be transitioning); proceeding -
+the save CC assertion will catch an empty level` and returns; `engineThreadDead` likewise
+returns. The downstream `AssertReadBackHasCommandCenter` is the fail-closed backstop. No other
+logic changed; ASCII-only log strings; no commit/deploy.
+
+UNVERIFIED: whether waiting removes the teardown race on a live run (the read-back CC assertion
+will prove it).
+
+## Fix: reorder construction until AFTER the start-screen settle gate (build+audit clean, NOT committed/deployed)
+
+`src/Day0Gen.cs`, `RunConstructGenerateSave` only. Root cause (see `notes/real-survival-path.md`):
+the construct->generate->SetLevel block mirrored the real survival/CC handler but ran during engine
+startup, before the start screen settled. The engine's startup `ZXSystem_StartScreen` teardown then
+nulls `ZXGameState.Current`/`ZXLevelState.Current`; `gamesystem.SetLevel(level)` subsequently NREs in
+`ZXLevelState.Set` (`ZXLevelState.cs:1167`, `ZXGameState.Current.LevelState = <new>`).
+
+Change: moved the whole construction block (new `ZXGameState` + `Set`, `GameMode=Survival`,
+`ZXRandomLevelParams` + all `SetProp`s, `gs.SurvivalModeParams`, `new ZXLevelState` + `Set` + `Init`,
+`DXSystem.Load<gamesystem>(false)`, `manager.CurrentGameSystem=sys`, effective-params read-back log)
+to immediately AFTER `WaitForStartScreenSettled(effectiveSavesDir)` and before the generator invoke.
+`LogProjectDiagnostics`, `DumpZxLogTail`, `ReVerifyThemeTableQuick`, `WaitForEntityDefaultParamsGate`
+and `WaitForStartScreenSettled` stay in place ahead of it. New order: diagnostics / theme re-verify /
+entity-params gate / start-screen gate -> construction -> generate -> SetLevel. Added a WHY comment at
+the block referencing `notes/real-survival-path.md`. Internal order, names (`gs`/`p`/`ls`/`sys`) and
+log strings unchanged; `make build` and `make audit` clean. Live re-test pending.
+
+## Strategy change: drive construct/generate/save through the engine loading dialog (build+audit clean, NOT deployed)
+
+Per `notes/code-review-3.md` C1/E + `notes/loading-dialog-contract.md`, the out-of-band main-thread
+sequence is gone. `RunConstructGenerateSave` now keeps the readiness gates
+(`LogProjectDiagnostics`, `DumpZxLogTail`, `ReVerifyThemeTableQuick`, `WaitForEntityDefaultParamsGate`,
+`WaitForStartScreenSettled`) BEFORE the dialog, then invokes the manager loading dialog
+`#=z9DPDdq9qP9lZ(int delay, Action create, Action saveAfter, List<string> messages, bool showLoading)`
+(`--z4RevDP3eECXqXS6JRA--.cs:2914`) with `(20, create, saveAfter, new List<string>(), true)`.
+
+- **Discovery**: exact escaped name `N_LOADING_DIALOG` + a strict 5-arg signature check
+  `IsLoadingDialogSignature`; on name miss/mismatch a signature scan over `ManagerType`; null aborts
+  at the invoke site (`InvokeManagerLoadingDialog`).
+- **create** = `CreateGameStateAndLevel()` (Task thread): construct ZXGameState/params/ZXLevelState
+  + `DXSystem.Load<gamesystem>(false)` + `manager.CurrentGameSystem=sys` + generator + `SetLevel
+  (with the existing NRE tolerance) + `VerifySetLevelEngineCompletion` + `VerifyCurrentLevelField` +
+  `AdoptLevelIntoLevelState`. Results in static `dialogGs/dialogParams/dialogLs/dialogSys/dialogLevel`;
+  on throw it logs the chain, stores `dialogCreateException` and RETHROWS so the dialog catches it and
+  never runs saveAfter (fail closed); `finally` sets `dialogCreateDone`.
+- **saveAfter** = `SaveGeneratedState()` (engine finish frame): `ReAssertStateBeforeSave` +
+  `LogCommandCenterDiagnostics` + SaveState-wrapper invoke + the mandatory existence checks; stores
+  `dialogSaveException` and sets `dialogSaveDone` in `finally` (never throws into the frame loop).
+- The dialog is invoked on the engine UI thread via the existing `RunOnEngineUiThread`/`
+  FindEngineUiMarshalTarget` machinery (the synchronous part touches `DXGame.Current.Scene`);
+  `showLoading=true` keeps create on a Task so `SetLevel`'s `InvokeOnStartFrame`+`WaitOne` still
+  signals. Main thread then `WaitOne(600000)` on `dialogSaveDone` (15-min `RunWithWatchdog` is the
+  outer backstop) and only then runs zxcheck / `ReadBackState` / `AssertReadBackHasCommandCenter` /
+  save-list on the main thread.
+- **C2**: `ReAssertStateBeforeSave` now also re-asserts `DXLevel.Current == dialogLevel` via
+  `FindDxLevelCurrentProp`/`FindDxLevelCurrentField` and aborts if it will not stick (PreSave
+  `ZXLevelState.cs:1630` early-returns on a null `DXLevel.Current`).
+- **C4**: post-save verification failure (and the saveAfter-failed path) calls
+  `CleanupWrittenArtifacts(target, checkPath)` to delete the written target, zxcheck and the
+  `<stem>_Crash.zxsav/.zxcheck` pair before throwing; the success path never deletes.
+
+UNVERIFIED: no live run. Whether the dialog is callable from a foreign thread without racing the
+scene machine, whether the finish-frame handoff actually fires `saveAfter` in this process, and
+whether `DXLevel.Current`/fog survive to `PreSave` are all DXVision-dependent and need a live
+`--phase full` re-test. `make build` (0 warnings) + `make audit` clean.
+
+## Envelope fix: replace the animation-gated loading dialog with a direct start-game envelope (build+audit clean, NOT committed/deployed)
+
+`src/Day0Gen.cs` only. The live run invoked the manager loading dialog `#=z9DPDdq9qP9lZ` but its
+dispatch is gated on an overlay fade animation (`#=zXAMaTPI_`, `--z4RevDP3eECXqXS6JRA--.cs:3191`):
+it runs `create` only on the animation's `OnFinished` and drops the delegate when `DXGame.Scene ==
+null`. After a `ChangeScene` the callback never fired, so `create` never started and the tool idled
+to the 600 s timeout. The dialog is no longer invoked.
+
+New `InvokeStartGameEnvelope(Action create, Action saveAfter)` replicates the dialog's
+non-animation lifecycle:
+1. `RunOnEngineUiThread`: `DXGame.Current.Paused = true`; if `CurrentGameSystem != null` then
+   `Enabled = false`, `Dispose()`, `CurrentGameSystem = null`; `IsLoading = true` (optional).
+2. `Task.Factory.StartNew`: `create()` then `DXGame.Current.InvokeOnStartFrame(saveAfter)` - the
+   same engine frame queue `SetLevel` already relies on. On throw it stores `dialogCreateException`
+   and sets `dialogSaveDone` (fail closed).
+3. Main thread still `WaitOne(DialogCompletionTimeoutMs)` on `dialogSaveDone`; existing
+   `dialogCreateException`/`dialogSaveException`, post-save verification and `CleanupWrittenArtifacts`
+   unchanged. If `InvokeOnStartFrame` never runs, `saveAfter` never fires, the 600 s wait times out
+   and the run aborts (the 15-min `RunWithWatchdog` is the outer backstop).
+
+Discovery is runtime-only via stable engine names (no escaped names): `FindTypeAnyOrder` for
+`DXVision.DXGame`; `FindPropertyUp`/`FindFieldUp` for static `Current`, writable bool `Paused`, and
+manager `IsLoading`; a base-chain scan for the instance `InvokeOnStartFrame(Action)`; the existing
+`refl.CurrentGameSystemProp` for `CurrentGameSystem`. Any required miss (`DXGame.Current`, `Paused`,
+`InvokeOnStartFrame`, `CurrentGameSystem`) aborts with a `Day0GenException` naming it - never an
+inline fallback. `LoadingDialogMethod` discovery is kept but nothing calls the dialog.
+
+UNVERIFIED: no live run. Whether `DXGame.Current` is non-null at envelope time, whether the engine
+start-frame queue actually runs the queued `saveAfter`, and whether the pause/dispose envelope
+avoids the previous crash are all DXVision-dependent and need a live `--phase full` re-test.
+`make build` (0 warnings) + `make audit` clean.
+
+## P2 fix (2026-09-29): envelope save runs directly on the create Task
+
+Live run proved `InvokeStartGameEnvelope`'s create path works (`SetLevel` + adopt verified,
+`LoadLevel - End`, `CREATE: ... complete`), but the save was queued via
+`DXGame.Current.InvokeOnStartFrame(saveAfterAction)` from the Task thread and **never ran**: the
+envelope pauses the engine (`Paused = true`), so the start-frame queue is not drained (CPU near-idle,
+black screen), and the tool idled to the 600 s timeout. Fix in `src/Day0Gen.cs`:
+`Task.Factory.StartNew` now calls `saveAfterAction()` **directly on the same Task right after
+`createAction()`** - no frame-queue dependency. The engine is already paused, so `SaveGeneratedState`
+(`ReAssertStateBeforeSave` + `LogCommandCenterDiagnostics` + the game's SaveState wrapper) is safe
+there, matching how pre-envelope runs produced valid saves off-frame. Removed the
+`InvokeOnStartFrame` discovery block, its required-miss abort, the `invokeOnStartFrame` local, the
+`gameNow == null` re-fetch/guard, and the now-inaccurate references/log strings/comments in this
+path (`InvokeOnStartFrame` references in the `SetLevel` comments are unchanged). Required-member
+aborts that remain: `DXVision.DXGame`, `DXGame.Current`, `DXGame.Paused`, manager `CurrentGameSystem`,
+and `managerInstance` - all still fail closed with no inline create fallback. C2/ C4 / gates /
+`RunConstructGenerateSave`'s 600 s wait unchanged. `make build` (0 warnings) + `make audit` clean.
+Not committed, not deployed, no live run.
+
+## Entity-snapshot save path: PreSave -> overwrite -> native writer (build+audit clean, NOT committed/deployed)
+
+`src/Day0Gen.cs` only. Live run proved the envelope create->generate->SetLevel->adopt sequence
+completes and writes a save, but the save is EMPTY (`CC DIAG: live DXGame CSalvable components = 0`;
+`generated level Entities=Count=61467, CommandCenter=True`; read-back `LevelEntities count=0`).
+Root cause: `ZXLevelState.PreSave` (`vendor/decompiled/ZX/ZXLevelState.cs:1627-1674`) clears
+`CurrentGeneratedLevel.Entities`, removes CSalvable `ExtraEntities`, then rebuilds `LevelEntities =
+DXGame.Current.ComponentsOfType<CSalvable>()...`. That live registry is populated only by scene
+registration (`CreateSceneObject`/`AddToScene`), which the tolerated `SetLevel` scene-object NRE
+aborts, so the rebuild yields nothing and the SaveState wrapper writes an empty save.
+
+Fix (deterministic; does NOT drive the scene machine), in `SaveGeneratedState`:
+1. `BuildPreSaveEntitySnapshot(level)` snapshots the generated level's OWN `Entities` list BEFORE
+   PreSave clears it and builds the two dictionaries with PreSave's own predicate
+   (`ZXLevelState.cs:1644-1672`): `LevelEntities` keyed by `entity.ID` for not-fast entities with
+   the dead/unbuilt filter (a ZXEntity whose life `IsAlive == false` is kept only when it is a
+   `Structure` with `IsBeingBuilt == true`); `LevelFastSerializedEntities` keyed by
+   `entity.IDTemplate.Value`, grouping `(ID, Position)` into `DXTupla2<ulong,PointF>` for
+   not-dead fast entities. Reflected members: `ZX.Entities.ZXEntity` / `Structure`,
+   `ZXEntity.UseFastSerializing` (property), the life accessor `#=zS6TvFuwF_68l()`, the life
+   object's `IsAlive` (property/field), `Structure.IsBeingBuilt`, entity `ID` / `IDTemplate` /
+   `Position`, and `DXVision.DXTupla2`2` (2-arg ctor, else `A`/`B` field/property fallback).
+   Missing filter members log and fail open (not fast / keep); an unbuildable `DXTupla2` logs and
+   leaves the fast dict empty (never aborts). The two required properties are discovered
+   fail-closed.
+2. `refl.PreSaveMethod` (exact escaped name `_0023_003DzQXHqcVh9mGZZ`, instance 0-arg void, walked
+   over the `LevelStateType` base chain, discovered in `DiscoverAll`) is invoked explicitly on `ls`.
+3. `ls.LevelEntities` / `ls.LevelFastSerializedEntities` are overwritten with the snapshot.
+4. `refl.SaveWriterMethod` (`#=zMtGuEM2lBSlZ5BGWvg==`, instance `(string)->void`) is invoked on
+   `managerInstance` with `dialogTarget`. It serializes `ZXGameState.Current` (already re-asserted
+   by `ReAssertStateBeforeSave`), so the overwritten dictionaries are what is written. The SaveState
+   wrapper is NOT called on this path (its PreSave would re-wipe the dictionaries); its discovery
+   remains but is unused.
+
+Fail-closed: a missing `PreSaveMethod` or `SaveWriterMethod` aborts with a named
+`Day0GenException` before the save; `managerInstance == null` aborts; the existing
+`dialogTarget`/`dialogCheckPath` existence checks, `SAVEAFTER` log, stored-exception behavior, C2
+(`ReAssertStateBeforeSave`) and C4 (`CleanupWrittenArtifacts`) are unchanged. Log strings/comments
+updated to describe the snapshot->PreSave->overwrite->native-writer path and WHY (live registry is
+empty because the tolerated scene-object NRE aborts engine registration; the native writer
+serializes the static game state, so a hand-built `LevelEntities` is honored).
+
+UNVERIFIED: no live run (tool not executed; do NOT deploy/run per task). The save's in-game
+loadability is unverified - the tool only read-backs the ZIP (`ZipSerializer.Read(path,"Data")`).
+`make build` (0 warnings) + `make audit` clean.
+
+FIX: BuildPreSaveEntitySnapshot resolves the fast-entity IDTemplate key robustly - a nullable/ulong IDTemplate boxes as a plain System.UInt64 (no "Value" member), so read it directly when integral, else via ReadMemberValue(.,"Value"); entity.ID/Position are non-nullable and unchanged. Local only, no commit/deploy/run.
