@@ -631,3 +631,20 @@ loadability is unverified - the tool only read-backs the ZIP (`ZipSerializer.Rea
 `make build` (0 warnings) + `make audit` clean.
 
 FIX: BuildPreSaveEntitySnapshot resolves the fast-entity IDTemplate key robustly - a nullable/ulong IDTemplate boxes as a plain System.UInt64 (no "Value" member), so read it directly when integral, else via ReadMemberValue(.,"Value"); entity.ID/Position are non-nullable and unchanged. Local only, no commit/deploy/run.
+FIX: `BuildPreSaveEntitySnapshot` now keeps ONLY entities with the `CSalvable` component (mirrors `ComponentsOfType<CSalvable>()`): resolves `DXVision.DXEntity.HasComponent<T>()` via `FindGenericBoolMethodUp` + `MakeGenericMethod(ZX.Components.CSalvable)` and aborts (named `Day0GenException`) if either is missing; filter runs before the fast/not-fast split so both branches are filtered; logs `SAVE SNAPSHOT: level.Entities=<n>, CSalvable kept=<k>, skipped=<n-k>`. Local only, no commit/deploy/run.
+
+## VERIFIED 2026-09-30 - day-0 CommandCenter save produced AND loads in-game
+Build `dce5f440` (commit `f79ed67`). Live run: `SAVE SNAPSHOT: level.Entities=61508, CSalvable
+kept=6749, skipped=54759` -> `LevelEntities=41 (CommandCenter=True), fast-serialized entities=6708
+in 8 template group(s)`; read-back `LevelEntities count=41, commandCenterPresent=True`; `PHASE full
+COMPLETE`. Artifacts: `CC 550040233.zxsav` ~247 KB + `.zxcheck`, no `_Crash` pair. User loaded it
+in-game: the level loads WITH the Command Center.
+
+Chain that makes it work: (1) the engine-owned start-game envelope (pause + dispose/nul
+`CurrentGameSystem` + `IsLoading`, create+save on one Task) replaces the animation-gated manager
+loading dialog that stalled; (2) `PreSave`'s live `DXGame.Current.ComponentsOfType<CSalvable>()`
+registry is empty because the tolerated `SetLevel` scene-object NRE aborts engine registration, so
+the tool snapshots the generated level's own entities, filters to `CSalvable`, runs `PreSave`,
+overwrites `LevelEntities`/`LevelFastSerializedEntities`, then calls the native writer directly;
+(3) filtering to `CSalvable` excludes terrain (`Cliff` etc., which the game regenerates from the map
+layers) - including them double-created terrain and crashed on `Cliff.OnSceneAdded`.

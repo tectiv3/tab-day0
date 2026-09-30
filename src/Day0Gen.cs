@@ -4794,11 +4794,49 @@ namespace Day0Gen
                           (tupleDef == null ? "not found" : tupleDef.FullName) +
                           ") - fast-serialized entities will be OMITTED from the save.");
 
+            // CSalvable filter. PreSave sources LevelEntities from the LIVE
+            // DXGame.Current.ComponentsOfType<CSalvable>() registry (ZXLevelState.cs:1644-1672),
+            // i.e. only entities carrying a CSalvable component. SetLevel's
+            // AddComponent<CSalvable>() loop runs BEFORE UpdateLevel moves the generated
+            // terrain/extra entities into level.Entities, so those entities never carry
+            // CSalvable; the game regenerates the terrain from the map layers on load.
+            // Writing them once AND letting the game regenerate them double-creates terrain
+            // and crashes (ZX.Cliff.OnSceneAdded NRE). Fail closed on a discovery miss -
+            // falling back to "include everything" is exactly that double-create bug.
+            Type csalvableType = FindTypeAnyOrder("ZX.Components.CSalvable", refl.TabAssembly);
+            if (csalvableType == null)
+                throw new Day0GenException("Save snapshot: ZX.Components.CSalvable type not found (build drift?) - " +
+                    "cannot filter level.Entities to the CSalvable registry; aborting (fail closed).");
+            Type dxEntityType = FindTypeAnyOrder("DXVision.DXEntity", refl.DxAssembly);
+            MethodInfo hasComponentDef = FindGenericBoolMethodUp(dxEntityType, "HasComponent", 0);
+            if (hasComponentDef == null)
+                throw new Day0GenException("Save snapshot: DXEntity.HasComponent<T>() not found (build drift?) - " +
+                    "cannot filter level.Entities to the CSalvable registry; aborting (fail closed).");
+            MethodInfo hasComponent;
+            try { hasComponent = hasComponentDef.MakeGenericMethod(csalvableType); }
+            catch (Exception ex)
+            {
+                throw new Day0GenException("Save snapshot: HasComponent<" + csalvableType.FullName +
+                    "> MakeGenericMethod failed: " + DescribeException(ex));
+            }
+
             Type fastListType = fastProp.PropertyType.GetGenericArguments()[1]; // List<DXTupla2<...>>
             int fastCount = 0, fastOmitted = 0, deadDropped = 0;
+            int totalEntities = 0, csalvableKept = 0, csalvableSkipped = 0;
             foreach (object entity in entities)
             {
-                if (entity == null) continue;
+                totalEntities++;
+                if (entity == null) { csalvableSkipped++; continue; }
+                object hasObj;
+                try { hasObj = hasComponent.Invoke(entity, null); }
+                catch (Exception ex)
+                {
+                    throw new Day0GenException("Save snapshot: HasComponent<CSalvable>() invoke failed on " +
+                        (entity.GetType().FullName != null ? entity.GetType().FullName : entity.GetType().Name) +
+                        ": " + DescribeException(ex));
+                }
+                if (!(hasObj is bool) || !(bool)hasObj) { csalvableSkipped++; continue; }
+                csalvableKept++;
                 bool isZx = zxEntityType != null && zxEntityType.IsInstanceOfType(entity);
                 bool useFast = false;
                 if (isZx && useFastProp != null)
@@ -4869,6 +4907,8 @@ namespace Day0Gen
             PreSaveEntitySnapshot snapshot = new PreSaveEntitySnapshot();
             snapshot.LevelEntities = levelDictObj;
             snapshot.FastSerializedEntities = fastDictObj;
+            Log.Write("SAVE SNAPSHOT: level.Entities=" + totalEntities + ", CSalvable kept=" + csalvableKept +
+                      ", skipped=" + csalvableSkipped + ".");
             Log.Write("SAVE SNAPSHOT: LevelEntities=" + levelById.Count + " (CommandCenter=" + cc +
                       ", dead/unbuilt dropped=" + deadDropped + "), fast-serialized entities=" + fastCount +
                       " in " + fastByTemplate.Count + " template group(s)" +
@@ -4927,6 +4967,33 @@ namespace Day0Gen
                 foreach (MethodInfo m in ms)
                 {
                     if (m.Name == name && m.GetParameters().Length == argCount) return m;
+                }
+            }
+            return null;
+        }
+
+        // Finds a generic, bool-returning method definition by name + arg count,
+        // walking the base chain (DeclaredOnly per level). Used to resolve
+        // DXEntity.HasComponent<T>() for the CSalvable snapshot filter.
+        private static MethodInfo FindGenericBoolMethodUp(Type t, string name, int argCount)
+        {
+            for (Type cur = t; cur != null; cur = cur.BaseType)
+            {
+                MethodInfo[] ms = null;
+                try
+                {
+                    ms = cur.GetMethods(BindingFlags.Instance | BindingFlags.Static |
+                                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                }
+                catch { }
+                if (ms == null) continue;
+                foreach (MethodInfo m in ms)
+                {
+                    if (m.Name != name) continue;
+                    if (!m.IsGenericMethodDefinition) continue;
+                    if (m.GetParameters().Length != argCount) continue;
+                    if (m.ReturnType != typeof(bool)) continue;
+                    return m;
                 }
             }
             return null;
